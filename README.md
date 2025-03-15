@@ -149,7 +149,7 @@ This approach is particularly effective in scenarios with significant distributi
 
 ## Acknowledgements
 
-- Original YOLOv12 provided by [ultralytics](https://github.com/ultralytics/ultralytics)
+- Original YOLOv12 provided by [sunsmarterjie](https://github.com/sunsmarterjie/yolov12)
 - TTA implementation inspired by research in test-time adaptation and domain generalization
 
 ## License

@@ -149,7 +149,7 @@ TTA 的工作原理是通过在线学习机制，让模型在推理过程中持�
 
 ## 致谢
 
-- 原始 YOLOv12 由 [ultralytics](https://github.com/ultralytics/ultralytics) 提供
+- 原始 YOLOv12 由 [sunsmarterjie](https://github.com/sunsmarterjie/yolov12) 提供
 - TTA 实现受到测试时适配和域泛化研究的启发
 
 ## 许可证
