@@ -1,0 +1,152 @@
+# YOLOv12 with Test-Time Adaptation
+# Optimized .gitignore for machine learning projects
+
+### Python ###
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+pytest-*.xml
+
+### Virtual Environments ###
+venv/
+env/
+ENV/
+.venv/
+.env/
+.python-version
+.conda/
+
+### ML Training & Models ###
+# Model files
+*.pt
+*.pth
+*.pkl
+*.onnx
+*.tflite
+*.torchscript
+*.engine
+*.trt
+*.pb
+*.saved_model
+*.h5
+
+# Training outputs
+runs/
+mlruns/
+.gradio/
+checkpoints/
+wandb/
+lightning_logs/
+
+# TTA specific
+tta_results/
+output_*/
+*_comparison.jpg
+
+### Media files ###
+*.mp4
+*.webm
+*.avi
+*.mov
+*.gif
+
+# Images (exclude by default, but keep specific examples)
+*.jpg
+*.png
+*.jpeg
+*.bmp
+!ultralytics/assets/*.jpg  # Keep example assets
+!examples/*/*.jpg          # Keep examples in subdirectories too
+!docs/images/*.png         # Keep documentation images
+!logo.png                  # Keep project logo
+
+### IDE & Editors ###
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Other editors
+*.sublime-project
+*.sublime-workspace
+.spyderproject
+.spyproject
+.ropeproject
+.project
+.settings
+
+### Jupyter Notebook ###
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+### Logs & Temp files ###
+logs/
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+tmp/
+temp/
+.tmp/
+
+### OS specific ###
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+.directory
