@@ -3,7 +3,7 @@
 Run prediction on images, videos, directories, globs, YouTube, webcam, streams, etc.
 
 Usage - sources:
-    $ yolo mode=predict model=yolov8n.pt source=0                               # webcam
+    $ yolo mode=predict model=yolo11n.pt source=0                               # webcam
                                                 img.jpg                         # image
                                                 vid.mp4                         # video
                                                 screen                          # screenshot
@@ -15,19 +15,21 @@ Usage - sources:
                                                 'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP, TCP stream
 
 Usage - formats:
-    $ yolo mode=predict model=yolov8n.pt                 # PyTorch
-                              yolov8n.torchscript        # TorchScript
-                              yolov8n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
-                              yolov8n_openvino_model     # OpenVINO
-                              yolov8n.engine             # TensorRT
-                              yolov8n.mlpackage          # CoreML (macOS-only)
-                              yolov8n_saved_model        # TensorFlow SavedModel
-                              yolov8n.pb                 # TensorFlow GraphDef
-                              yolov8n.tflite             # TensorFlow Lite
-                              yolov8n_edgetpu.tflite     # TensorFlow Edge TPU
-                              yolov8n_paddle_model       # PaddlePaddle
-                              yolov8n.mnn                # MNN
-                              yolov8n_ncnn_model         # NCNN
+    $ yolo mode=predict model=yolo11n.pt                 # PyTorch
+                              yolo11n.torchscript        # TorchScript
+                              yolo11n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
+                              yolo11n_openvino_model     # OpenVINO
+                              yolo11n.engine             # TensorRT
+                              yolo11n.mlpackage          # CoreML (macOS-only)
+                              yolo11n_saved_model        # TensorFlow SavedModel
+                              yolo11n.pb                 # TensorFlow GraphDef
+                              yolo11n.tflite             # TensorFlow Lite
+                              yolo11n_edgetpu.tflite     # TensorFlow Edge TPU
+                              yolo11n_paddle_model       # PaddlePaddle
+                              yolo11n.mnn                # MNN
+                              yolo11n_ncnn_model         # NCNN
+                              yolo11n_imx_model          # Sony IMX
+                              yolo11n_rknn_model         # Rockchip RKNN
 """
 
 import platform
@@ -38,17 +40,19 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
+from torch import optim
 
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data import load_inference_source
 from ultralytics.data.augment import LetterBox, classify_transforms
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.nn.modules.tta import TTAStrategy
+from ultralytics.nn.modules import Adaptor
 from ultralytics.utils import DEFAULT_CFG, LOGGER, MACOS, WINDOWS, callbacks, colorstr, ops
 from ultralytics.utils.checks import check_imgsz, check_imshow
 from ultralytics.utils.files import increment_path
-from ultralytics.utils.torch_utils import select_device, smart_inference_mode
-
+from ultralytics.utils.torch_utils import select_device
+from ultralytics.utils.loss import FeatureAlignmentLoss
 
 STREAM_WARNING = """
 WARNING ⚠️ inference results will accumulate in RAM unless `stream=True` is passed, causing potential out-of-memory
@@ -65,28 +69,54 @@ Example:
 
 class BasePredictor:
     """
-    BasePredictor.
-
     A base class for creating predictors.
+
+    This class provides the foundation for prediction functionality, handling model setup, inference,
+    and result processing across various input sources.
 
     Attributes:
         args (SimpleNamespace): Configuration for the predictor.
         save_dir (Path): Directory to save results.
         done_warmup (bool): Whether the predictor has finished setup.
-        model (nn.Module): Model used for prediction.
+        model (torch.nn.Module): Model used for prediction.
         data (dict): Data configuration.
         device (torch.device): Device used for prediction.
         dataset (Dataset): Dataset used for prediction.
-        vid_writer (dict): Dictionary of {save_path: video_writer, ...} writer for saving video output.
+        vid_writer (dict): Dictionary of {save_path: video_writer} for saving video output.
+        plotted_img (numpy.ndarray): Last plotted image.
+        source_type (SimpleNamespace): Type of input source.
+        seen (int): Number of images processed.
+        windows (list): List of window names for visualization.
+        batch (tuple): Current batch data.
+        results (list): Current batch results.
+        transforms (callable): Image transforms for classification.
+        callbacks (dict): Callback functions for different events.
+        txt_path (Path): Path to save text results.
+        _lock (threading.Lock): Lock for thread-safe inference.
+
+    Methods:
+        preprocess: Prepare input image before inference.
+        inference: Run inference on a given image.
+        postprocess: Process raw predictions into structured results.
+        predict_cli: Run prediction for command line interface.
+        setup_source: Set up input source and inference mode.
+        stream_inference: Stream inference on input source.
+        setup_model: Initialize and configure the model.
+        write_results: Write inference results to files.
+        save_predicted_images: Save prediction visualizations.
+        show: Display results in a window.
+        run_callbacks: Execute registered callbacks for an event.
+        add_callback: Register a new callback function.
     """
 
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         """
-        Initializes the BasePredictor class.
+        Initialize the BasePredictor class.
 
         Args:
-            cfg (str, optional): Path to a configuration file. Defaults to DEFAULT_CFG.
-            overrides (dict, optional): Configuration overrides. Defaults to None.
+            cfg (str | dict): Path to a configuration file or a configuration dictionary.
+            overrides (dict | None): Configuration overrides.
+            _callbacks (dict | None): Dictionary of callback functions.
         """
         self.args = get_cfg(cfg, overrides)
         self.save_dir = get_save_dir(self.args)
@@ -95,6 +125,19 @@ class BasePredictor:
         self.done_warmup = False
         if self.args.show:
             self.args.show = check_imshow(warn=True)
+
+        # TTA specific args
+        self.args.tta = getattr(self.args, "tta", False)
+        self.args.tta_feature_layer = getattr(self.args, "tta_feature_layer", -1)
+        self.args.tta_conf_threshold = getattr(
+            self.args, "tta_conf_threshold", 0.5
+        )  # Confidence threshold for using predicted boxes in TTA
+        self.args.tta_bn_only = getattr(self.args, "tta_bn_only", True)
+        self.args.tta_lr = getattr(self.args, "tta_lr", 0.001)
+        self.args.tta_alpha = getattr(self.args, "tta_alpha", 0.01)  # EMA decay for test features
+        self.args.tta_alpha_ema_loss = getattr(self.args, "tta_alpha_ema_loss", 0.01)  # EMA decay for L_img loss
+        self.args.tta_tau1 = getattr(self.args, "tta_tau1", 1.1)  # Threshold 1 for update
+        self.args.tta_tau2 = getattr(self.args, "tta_tau2", 1.05)  # Threshold 2 for update
 
         # Usable if setup is done
         self.model = None
@@ -114,12 +157,12 @@ class BasePredictor:
         self.txt_path = None
         self._lock = threading.Lock()  # for automatic thread-safe inference
 
-        # TTA related attributes
-        self.tta_enabled = self.args.tta if hasattr(self.args, "tta") else False
-        self.tta_strategy = None
-        self.collected_train_stats = False
-        self.current_loss = 0.0
-        self.distribution_stats = []
+        # TTA state variables
+        self.tta_enabled = False
+        self.tta_criterion = None
+        self.tta_optimizer = None
+        self.tta_stats = None
+        self.done_tta_warmup = False
 
         callbacks.add_integration_callbacks(self)
 
@@ -128,7 +171,7 @@ class BasePredictor:
         Prepares input image before inference.
 
         Args:
-            im (torch.Tensor | List(np.ndarray)): BCHW for tensor, [(HWC) x B] for list.
+            im (torch.Tensor | List(np.ndarray)): Images of shape (N, 3, h, w) for tensor, [(h, w, 3) x N] for list.
         """
         not_tensor = not isinstance(im, torch.Tensor)
         if not_tensor:
@@ -144,7 +187,7 @@ class BasePredictor:
         return im
 
     def inference(self, im, *args, **kwargs):
-        """Runs inference on a given image using the specified model and arguments."""
+        """Run inference on a given image using the specified model and arguments."""
         visualize = (
             increment_path(self.save_dir / Path(self.batch[0][0]).stem, mkdir=True)
             if self.args.visualize and (not self.source_type.tensor)
@@ -157,10 +200,10 @@ class BasePredictor:
         Pre-transform input image before inference.
 
         Args:
-            im (List(np.ndarray)): (N, 3, h, w) for tensor, [(h, w, 3) x N] for list.
+            im (List[np.ndarray]): Images of shape (N, 3, h, w) for tensor, [(h, w, 3) x N] for list.
 
         Returns:
-            (list): A list of transformed images.
+            (List[np.ndarray]): A list of transformed images.
         """
         same_shapes = len({x.shape for x in im}) == 1
         letterbox = LetterBox(
@@ -171,11 +214,24 @@ class BasePredictor:
         return [letterbox(image=x) for x in im]
 
     def postprocess(self, preds, img, orig_imgs):
-        """Post-processes predictions for an image and returns them."""
+        """Post-process predictions for an image and return them."""
         return preds
 
     def __call__(self, source=None, model=None, stream=False, *args, **kwargs):
-        """Performs inference on an image or stream."""
+        """
+        Perform inference on an image or stream.
+
+        Args:
+            source (str | Path | List[str] | List[Path] | List[np.ndarray] | np.ndarray | torch.Tensor | None):
+                Source for inference.
+            model (str | Path | torch.nn.Module | None): Model for inference.
+            stream (bool): Whether to stream the inference results. If True, returns a generator.
+            *args (Any): Additional arguments for the inference method.
+            **kwargs (Any): Additional keyword arguments for the inference method.
+
+        Returns:
+            (List[ultralytics.engine.results.Results] | generator): Results objects or generator of Results objects.
+        """
         self.stream = stream
         if stream:
             return self.stream_inference(source, model, *args, **kwargs)
@@ -190,6 +246,11 @@ class BasePredictor:
         the inputs in a streaming manner. This method ensures that no outputs accumulate in memory by consuming the
         generator without storing results.
 
+        Args:
+            source (str | Path | List[str] | List[Path] | List[np.ndarray] | np.ndarray | torch.Tensor | None):
+                Source for inference.
+            model (str | Path | torch.nn.Module | None): Model for inference.
+
         Note:
             Do not modify this function or remove the generator. The generator ensures that no outputs are
             accumulated in memory, which is critical for preventing memory issues during long-running predictions.
@@ -199,7 +260,13 @@ class BasePredictor:
             pass
 
     def setup_source(self, source):
-        """Sets up source and inference mode."""
+        """
+        Set up source and inference mode.
+
+        Args:
+            source (str | Path | List[str] | List[Path] | List[np.ndarray] | np.ndarray | torch.Tensor):
+                Source for inference.
+        """
         self.imgsz = check_imgsz(self.args.imgsz, stride=self.model.stride, min_dim=2)  # check image size
         self.transforms = (
             getattr(
@@ -226,15 +293,27 @@ class BasePredictor:
             LOGGER.warning(STREAM_WARNING)
         self.vid_writer = {}
 
-    @smart_inference_mode()
     def stream_inference(self, source=None, model=None, *args, **kwargs):
-        """Streams real-time inference on camera feed and saves results to file."""
+        """
+        Stream real-time inference on camera feed and save results to file.
+        Includes TTA logic if enabled.
+
+        Args:
+            source (str | Path | List[str] | List[Path] | List[np.ndarray] | np.ndarray | torch.Tensor | None):
+                Source for inference.
+            model (str | Path | torch.nn.Module | None): Model for inference.
+            *args (Any): Additional arguments for the inference method.
+            **kwargs (Any): Additional keyword arguments for the inference method.
+
+        Yields:
+            (ultralytics.engine.results.Results): Results objects.
+        """
         if self.args.verbose:
             LOGGER.info("")
 
         # Setup model
         if not self.model:
-            self.setup_model(model)
+            self.setup_model(model)  # This now includes TTA setup
 
         with self._lock:  # for thread-safe inference
             # Setup source every time predict is called
@@ -249,119 +328,124 @@ class BasePredictor:
                 self.model.warmup(imgsz=(1 if self.model.pt or self.model.triton else self.dataset.bs, 3, *self.imgsz))
                 self.done_warmup = True
 
-            # Process first batch to collect training statistics if TTA is enabled
-            if self.tta_enabled and not self.collected_train_stats:
-                if len(self.dataset) > 0:
-                    for first_batch in self.dataset:
-                        first_paths, first_im0s, first_s = first_batch
-                        first_im = self.preprocess(first_im0s)
-                        try:
-                            self.tta_strategy.collect_train_statistics(first_im)
-                            self.collected_train_stats = True
-                            LOGGER.info("Initial TTA statistics collected")
-                        except Exception as e:
-                            LOGGER.error(f"Failed to collect initial TTA statistics: {str(e)}")
-                        break
-                    # Reset dataset iterator
-                    self.dataset.close()
-                    self.setup_source(source if source is not None else self.args.source)
-
             self.seen, self.windows, self.batch = 0, [], None
             profilers = (
-                ops.Profile(device=self.device),
-                ops.Profile(device=self.device),
-                ops.Profile(device=self.device),
+                ops.Profile(device=self.device),  # 0: Preprocess
+                ops.Profile(device=self.device),  # 1: Inference
+                ops.Profile(device=self.device),  # 2: Postprocess
+                ops.Profile(device=self.device),  # 3: TTA Feature Extraction
+                ops.Profile(device=self.device),  # 4: TTA Loss & Update
             )
+            for p in profilers:
+                p.dt = 0.0
             self.run_callbacks("on_predict_start")
             for self.batch in self.dataset:
                 self.run_callbacks("on_predict_batch_start")
                 paths, im0s, s = self.batch
-
-                # Preprocess
                 with profilers[0]:
                     im = self.preprocess(im0s)
 
-                # Apply TTA analysis if enabled
-                if self.tta_enabled and self.collected_train_stats:
-                    try:
-                        # Compute distribution and update strategy
-                        mu, sigma = self.tta_strategy.compute_distribution(im)
-                        self.tta_strategy.update_ema(mu)
+                if self.tta_enabled:
+                    if not self.done_tta_warmup:
+                        for m in self.model.model.modules():
+                            if isinstance(m, nn.BatchNorm2d):
+                                m.train()
+                        self.done_tta_warmup = True
+                    with torch.set_grad_enabled(True):
+                        raw = self.inference(im, *args, **kwargs)
+                        with profilers[3]:
+                            F_img, F_obj = self._extract_features_for_tta(im, raw)
+                        if F_img is not None:
+                            loss_out = self.tta_criterion(F_img, F_obj)
+                            loss_val = loss_out[0] if isinstance(loss_out, (tuple, list)) else loss_out
+                            self.tta_optimizer.zero_grad()
+                            with profilers[4]:
+                                loss_val.backward()
+                                self.tta_optimizer.step()
+                    for m in self.model.model.modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            m.eval()
 
-                        # Check distribution gap
-                        domain_gap = self.tta_strategy.compute_domain_gap()
-
-                        # Update adaptors if needed
-                        if self.current_loss > 0 and self.tta_strategy.should_update(self.current_loss):
-                            LOGGER.info(f"Updating TTA adaptors, domain gap: {domain_gap:.4f}")
-                            # Additional adaptor update logic could be added here
-                    except Exception as e:
-                        LOGGER.error(f"TTA analysis error: {str(e)}")
-
-                # Inference
                 with profilers[1]:
-                    preds = self.inference(im, *args, **kwargs)
-                    if self.args.embed:
-                        yield from [preds] if isinstance(preds, torch.Tensor) else preds  # yield embedding tensors
-                        continue
+                    with torch.no_grad():
+                        preds = self.inference(im, *args, **kwargs)
 
-                # Postprocess
+                if self.args.embed:
+                    yield from [preds] if isinstance(preds, torch.Tensor) else preds  # yield embedding tensors
+                    continue
+
                 with profilers[2]:
                     self.results = self.postprocess(preds, im, im0s)
                 self.run_callbacks("on_predict_postprocess_end")
 
-                # Update current loss for TTA (simplified example - you might want to use a proper loss calculation)
-                if self.tta_enabled and hasattr(self.results[0], "confidence"):
-                    try:
-                        # Use confidence as a simple proxy for loss - lower confidence means higher loss
-                        confidences = [
-                            result.confidence.mean().item() if hasattr(result, "confidence") else 0.5
-                            for result in self.results
-                        ]
-                        avg_confidence = sum(confidences) / len(confidences)
-                        self.current_loss = 1.0 - avg_confidence  # simple inverse relationship
-                    except Exception as e:
-                        LOGGER.error(f"Error updating TTA loss: {str(e)}")
-
-                # Visualize, save, write results
                 n = len(im0s)
                 for i in range(n):
                     self.seen += 1
-                    self.results[i].speed = {
+                    speed_metrics = {
                         "preprocess": profilers[0].dt * 1e3 / n,
                         "inference": profilers[1].dt * 1e3 / n,
                         "postprocess": profilers[2].dt * 1e3 / n,
                     }
+                    if self.tta_enabled:
+                        speed_metrics["tta_features"] = profilers[3].dt * 1e3 / n
+                        speed_metrics["tta_update"] = profilers[4].dt * 1e3 / n
+
+                    self.results[i].speed = speed_metrics
                     if self.args.verbose or self.args.save or self.args.save_txt or self.args.show:
                         s[i] += self.write_results(i, Path(paths[i]), im, s)
 
-                # Print batch results
                 if self.args.verbose:
                     LOGGER.info("\n".join(s))
 
                 self.run_callbacks("on_predict_batch_end")
                 yield from self.results
 
-        # Release assets
         for v in self.vid_writer.values():
             if isinstance(v, cv2.VideoWriter):
                 v.release()
 
-        # Print final results
         if self.args.verbose and self.seen:
-            t = tuple(x.t / self.seen * 1e3 for x in profilers)  # speeds per image
-            LOGGER.info(
-                f"Speed: %.1fms preprocess, %.1fms inference, %.1fms postprocess per image at shape "
-                f"{(min(self.args.batch, self.seen), 3, *im.shape[2:])}" % t
-            )
+            t_pre = profilers[0].t / self.seen * 1e3
+            t_inf = profilers[1].t / self.seen * 1e3
+            t_post = profilers[2].t / self.seen * 1e3
+            speed_str = f"Speed: {t_pre:.1f}ms preprocess, {t_inf:.1f}ms inference, {t_post:.1f}ms postprocess"
+            if self.tta_enabled:
+                t_tta_feat = profilers[3].t / self.seen * 1e3
+                t_tta_upd = profilers[4].t / self.seen * 1e3
+                speed_str += f", {t_tta_feat:.1f}ms TTA feats, {t_tta_upd:.1f}ms TTA update"
+            speed_str += f" per image at shape {(min(self.args.batch, self.seen), 3, *im.shape[2:])}"
+            LOGGER.info(speed_str)
+
         if self.args.save or self.args.save_txt or self.args.save_crop:
             nl = len(list(self.save_dir.glob("labels/*.txt")))  # number of labels
             s = f"\n{nl} label{'s' * (nl > 1)} saved to {self.save_dir / 'labels'}" if self.args.save_txt else ""
             LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}{s}")
         self.run_callbacks("on_predict_end")
 
+    def _extract_features_for_tta(self, im, preds_raw):
+        """
+        Placeholder for extracting features for TTA. Must be implemented by subclasses.
+
+        Args:
+            im (torch.Tensor): Preprocessed image tensor.
+            preds_raw (Any): Raw predictions from the model's inference step, potentially before NMS.
+
+        Returns:
+            tuple(torch.Tensor | None, dict | None):
+                - F_img: Image-level features.
+                - F_obj_dict: Object-level features dictionary {cls_idx: features}.
+        """
+        return None, None
+
     def setup_model(self, model, verbose=True):
-        """Initialize YOLO model with given parameters and set it to evaluation mode."""
+        """
+        Initialize YOLO model with given parameters and set it to evaluation mode.
+
+        Args:
+            model (str | Path | torch.nn.Module | None): Model to load or use.
+            verbose (bool): Whether to print verbose output.
+        """
+        # Standard model setup
         self.model = AutoBackend(
             weights=model or self.args.model,
             device=select_device(self.args.device, verbose=verbose),
@@ -372,34 +456,130 @@ class BasePredictor:
             fuse=True,
             verbose=verbose,
         )
-
-        self.device = self.model.device  # update device
-        self.args.half = self.model.fp16  # update half
+        self.device = self.model.device
+        self.args.half = self.model.fp16
         self.model.eval()
 
-        # Initialize TTA strategy if enabled
-        if self.tta_enabled:
-            LOGGER.info("Initializing Test-Time Adaptation strategy")
-            try:
-                self.tta_strategy = TTAStrategy(
-                    model=self.model,
-                    alpha=getattr(self.args, "tta_alpha", 0.01),
-                    tau1=getattr(self.args, "tta_tau1", 1.1),
-                    tau2=getattr(self.args, "tta_tau2", 1.05),
-                    momentum=getattr(self.args, "tta_momentum", 0.99),
-                    reduction_ratio=getattr(self.args, "tta_reduction_ratio", 32),
-                    tta_lr=getattr(self.args, "tta_lr", 0.001),
-                    feature_layer=getattr(self.args, "tta_feature_layer", -3),
-                )
-                # Initialize adaptors in the model
-                num_adaptors = self.tta_strategy.init_adaptors()
-                LOGGER.info(f"TTA enabled with {num_adaptors} adaptors")
-            except Exception as e:
-                LOGGER.error(f"Error initializing TTA: {str(e)}")
+        if self.args.tta:
+            self.tta_features = None
+
+            backend = getattr(self.model, "backend", "pytorch")
+            module = self.model.model if backend == "pytorch" and hasattr(self.model, "model") else self.model
+
+            named = list(module.named_modules())
+            idx = self.args.tta_feature_layer
+            if isinstance(idx, str):
+                target = dict(named).get(idx, None)
+            elif isinstance(idx, int):
+                idx = idx % len(named)
+                target = named[idx][1]
+            else:
+                target = named[-2][1]
+            if target is None:
                 self.tta_enabled = False
+                return
+
+            target.register_forward_hook(lambda m, inp, out: setattr(self, "tta_features", out))
+
+            try:
+                model_path = (
+                    Path(self.args.model)
+                    if isinstance(self.args.model, (str, Path)) and Path(self.args.model).is_file()
+                    else None
+                )
+                tta_stats_path = model_path.parent / "tta_stats.pt" if model_path else None
+
+                if tta_stats_path is None or not tta_stats_path.exists():
+                    train_dir = self.save_dir.parent / "train"
+                    if train_dir.is_dir():
+                        tta_stats_path = train_dir / "tta_stats.pt"
+                    else:
+                        tta_stats_path = self.save_dir / "tta_stats.pt"
+
+                if tta_stats_path.exists():
+                    self.tta_stats = torch.load(tta_stats_path, map_location=self.device)
+                    LOGGER.info(f"Loaded TTA statistics from {tta_stats_path}")
+
+                    default_D_in_KL = 0.5
+                    D_in_KL = self.tta_stats.get("D_in_KL", default_D_in_KL)
+                    if D_in_KL == default_D_in_KL and "D_in_KL" not in self.tta_stats:
+                        LOGGER.warning(f"D_in_KL not found in TTA stats, using default value: {default_D_in_KL}")
+
+                    mu_img = self.tta_stats.get("mu_img")
+                    inv_sigma_sq_img = self.tta_stats.get("inv_sigma_sq_img")
+                    mu_obj_dict = self.tta_stats.get("mu_obj_dict")
+                    inv_sigma_sq_obj_dict = self.tta_stats.get("inv_sigma_sq_obj_dict")
+                    pi_obj = self.tta_stats.get("pi_obj")  # Can be None
+
+                    self.tta_criterion = FeatureAlignmentLoss(
+                        nc=len(self.model.names),
+                        feat_stats={
+                            "mu_img": mu_img,  # Use loaded mu_img
+                            "inv_sigma_sq_img": inv_sigma_sq_img,  # Use loaded inv_sigma_sq_img
+                            "mu_obj_dict": mu_obj_dict,  # Use loaded mu_obj_dict
+                            "inv_sigma_sq_obj_dict": inv_sigma_sq_obj_dict,  # Use loaded inv_sigma_sq_obj_dict
+                            "pi_obj": pi_obj,  # Use loaded pi_obj (can be None)
+                        },
+                        alpha=self.args.tta_alpha,
+                        alpha_ema_loss=self.args.tta_alpha_ema_loss,
+                        D_in_KL=D_in_KL,
+                        tau1=self.args.tta_tau1,
+                        tau2=self.args.tta_tau2,
+                    ).to(self.device)
+
+                    tta_params = []
+                    target_model = self.model.model
+                    for p in target_model.parameters():
+                        p.requires_grad_(False)
+                    if self.args.tta_bn_only:
+                        for m in target_model.modules():
+                            if isinstance(m, nn.BatchNorm2d):
+                                for p in m.parameters():
+                                    p.requires_grad_(True)
+                                    tta_params.append(p)
+                    else:
+                        for m in target_model.modules():
+                            if isinstance(m, Adaptor):
+                                for p in m.parameters():
+                                    p.requires_grad_(True)
+                                    tta_params.append(p)
+
+                    if not tta_params:
+                        LOGGER.warning(
+                            "TTA enabled but no parameters selected for optimization (check tta_bn_only and model structure). Disabling TTA."
+                        )
+                        self.tta_enabled = False
+                    else:
+                        self.tta_optimizer = optim.Adam(tta_params, lr=self.args.tta_lr)
+                        self.tta_enabled = True
+                        LOGGER.info(
+                            f"TTA enabled with {len(tta_params)} trainable parameters (lr={self.args.tta_lr}, bn_only={self.args.tta_bn_only})"
+                        )
+
+                else:
+                    LOGGER.warning(
+                        f"TTA statistics file not found at expected locations ({tta_stats_path} or others). TTA disabled."
+                    )
+                    self.tta_enabled = False
+            except Exception as e:
+                LOGGER.error(f"Failed to setup TTA: {e}", exc_info=True)
+                self.tta_enabled = False
+        else:
+            self.tta_enabled = False
 
     def write_results(self, i, p, im, s):
-        """Write inference results to a file or directory."""
+        """
+        Write inference results to a file or directory.
+
+        Args:
+            i (int): Index of the current image in the batch.
+            p (Path): Path to the current image.
+            im (torch.Tensor): Preprocessed image tensor.
+            s (List[str]): List of result strings.
+
+        Returns:
+            (str): String with result information.
+        """
         string = ""  # print string
         if len(im.shape) == 3:
             im = im[None]  # expand for batch dim
@@ -439,7 +619,13 @@ class BasePredictor:
         return string
 
     def save_predicted_images(self, save_path="", frame=0):
-        """Save video predictions as mp4 at specified path."""
+        """
+        Save video predictions as mp4 or images as jpg at specified path.
+
+        Args:
+            save_path (str): Path to save the results.
+            frame (int): Frame number for video mode.
+        """
         im = self.plotted_img
 
         # Save videos and streams
@@ -467,7 +653,7 @@ class BasePredictor:
             cv2.imwrite(str(Path(save_path).with_suffix(".jpg")), im)  # save to JPG for best support
 
     def show(self, p=""):
-        """Display an image in a window using the OpenCV imshow function."""
+        """Display an image in a window."""
         im = self.plotted_img
         if platform.system() == "Linux" and p not in self.windows:
             self.windows.append(p)
@@ -477,10 +663,10 @@ class BasePredictor:
         cv2.waitKey(300 if self.dataset.mode == "image" else 1)  # 1 millisecond
 
     def run_callbacks(self, event: str):
-        """Runs all registered callbacks for a specific event."""
+        """Run all registered callbacks for a specific event."""
         for callback in self.callbacks.get(event, []):
             callback(self)
 
     def add_callback(self, event: str, func):
-        """Add callback."""
+        """Add a callback function for a specific event."""
         self.callbacks[event].append(func)

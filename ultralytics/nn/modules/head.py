@@ -12,14 +12,13 @@ from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 
 from .block import DFL, BNContrastiveHead, ContrastiveHead, Proto
 from .conv import Conv, DWConv
-from .tta import TTAMixin
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
 __all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
 
 
-class Detect(nn.Module, TTAMixin):
+class Detect(nn.Module):
     """YOLO Detect head for detection models."""
 
     dynamic = False  # force grid reconstruction
@@ -33,7 +32,7 @@ class Detect(nn.Module, TTAMixin):
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
 
     def __init__(self, nc=80, ch=()):
-        """Initializes the YOLO detection layer with specified number of classes and channels."""
+        """Initialize the YOLO detection layer with specified number of classes and channels."""
         super().__init__()
         self.nc = nc  # number of classes
         self.nl = len(ch)  # number of detection layers
@@ -62,9 +61,6 @@ class Detect(nn.Module, TTAMixin):
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
 
-        # Initialize TTA adaptor for feature refinement
-        self._init_tta(out_channels=self.no)
-
     def forward(self, x):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         if self.end2end:
@@ -74,19 +70,7 @@ class Detect(nn.Module, TTAMixin):
             x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
         if self.training:  # Training path
             return x
-
         y = self._inference(x)
-
-        # Apply TTA adaptor during inference only
-        if not self.training:
-            # Handle different return types based on export mode
-            if self.export:
-                # For exported models, apply adaptor directly to output
-                y = self.apply_adaptor(y)
-            else:
-                # For standard inference, apply to prediction part only
-                y = (self.apply_adaptor(y[0]), y[1]) if isinstance(y, tuple) else self.apply_adaptor(y)
-
         return y if self.export else (y, x)
 
     def forward_end2end(self, x):
@@ -110,11 +94,6 @@ class Detect(nn.Module, TTAMixin):
             return {"one2many": x, "one2one": one2one}
 
         y = self._inference(one2one)
-
-        # Apply TTA adaptor to inference outputs
-        if not self.training:
-            y = self.apply_adaptor(y)
-
         y = self.postprocess(y.permute(0, 2, 1), self.max_det, self.nc)
         return y if self.export else (y, {"one2many": x, "one2one": one2one})
 
@@ -294,7 +273,7 @@ class Pose(Detect):
         else:
             y = kpts.clone()
             if ndim == 3:
-                y[:, 2::3] = y[:, 2::3].sigmoid()  # sigmoid (WARNING: inplace .sigmoid_() Apple MPS bug)
+                y[:, 2::ndim] = y[:, 2::ndim].sigmoid()  # sigmoid (WARNING: inplace .sigmoid_() Apple MPS bug)
             y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
@@ -421,7 +400,7 @@ class RTDETRDecoder(nn.Module):
             nh (int): Number of heads in multi-head attention. Default is 8.
             ndl (int): Number of decoder layers. Default is 6.
             d_ffn (int): Dimension of the feed-forward networks. Default is 1024.
-            dropout (float): Dropout rate. Default is 0.
+            dropout (float): Dropout rate. Default is 0.0.
             act (nn.Module): Activation function. Default is nn.ReLU.
             eval_idx (int): Evaluation index. Default is -1.
             nd (int): Number of denoising. Default is 100.
@@ -584,7 +563,6 @@ class RTDETRDecoder(nn.Module):
 
         return embeddings, refer_bbox, enc_bboxes, enc_scores
 
-    # TODO
     def _reset_parameters(self):
         """Initializes or resets the parameters of the model's various components with predefined weights and biases."""
         # Class and bbox head init

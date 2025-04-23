@@ -1,0 +1,48 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Parameters
+nc: 80 # number of classes
+scales: # model compound scaling constants, i.e. 'model=yolo12n-tta.yaml' will call yolo12-tta.yaml with scale 'n'
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024] # summary: 505 layers, 2,609,876 parameters, 2,609,860 gradients, 3.4 GFLOPs
+  s: [0.50, 0.50, 1024] # summary: 505 layers, 9,312,072 parameters, 9,312,056 gradients, 10.9 GFLOPs
+  m: [0.50, 1.00, 512] # summary: 541 layers, 20,256,112 parameters, 20,256,096 gradients, 34.3 GFLOPs
+  l: [1.00, 1.00, 512] # summary: 871 layers, 26,507,728 parameters, 26,507,712 gradients, 45.2 GFLOPs
+  x: [1.00, 1.50, 512] # summary: 871 layers, 59,336,136 parameters, 59,336,120 gradients, 100.8 GFLOPs
+
+# YOLO12n backbone with Adaptors
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]] # 2
+  - [-1, 1, Adaptor, [256, 32, True]] # 3 (Associated with layer 2 blocks)
+  - [-1, 1, Conv, [256, 3, 2]] # 4-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]] # 5
+  - [-1, 1, Adaptor, [512, 32, True]] # 6 (Associated with layer 5 blocks)
+  - [-1, 1, Conv, [512, 3, 2]] # 7-P4/16
+  - [-1, 4, A2C2f, [512, True, 4]] # 8
+  - [-1, 1, Adaptor, [512, 32, True]] # 9 (Associated with layer 8 blocks)
+  - [-1, 1, Conv, [1024, 3, 2]] # 10-P5/32
+  - [-1, 4, A2C2f, [1024, True, 1]] # 11
+  - [-1, 1, Adaptor, [1024, 32, True]] # 12 (Associated with layer 11 blocks)
+
+# YOLO12n head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 9], 1, Concat, [1]] # cat backbone P4
+  - [-1, 2, A2C2f, [512, False, -1]] # 15
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]] # cat backbone P3
+  - [-1, 2, A2C2f, [256, False, -1]] # 18
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 15], 1, Concat, [1]] # cat head P4
+  - [-1, 2, A2C2f, [512, False, -1]] # 21
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]] # cat head P5
+  - [-1, 2, C3k2, [1024, True]]
+
+  - [[18, 21, 24], 1, Detect, [nc]] # Detect(P3, P4, P5)

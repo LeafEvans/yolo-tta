@@ -2,22 +2,22 @@
 """
 Ultralytics modules.
 
-Example:
-    Visualize a module with Netron.
-    ```python
-    from ultralytics.nn.modules import *
-    import torch
-    import os
+This module provides access to various neural network components used in Ultralytics models, including convolution blocks,
+attention mechanisms, transformer components, and detection/segmentation heads.
 
-    x = torch.ones(1, 128, 40, 40)
-    m = Conv(128, 128)
-    f = f"{m._get_name()}.onnx"
-    torch.onnx.export(m, x, f)
-    os.system(f"onnxslim {f} {f} && open {f}")  # pip install onnxslim
-    ```
+Examples:
+    Visualize a module with Netron.
+    >>> from ultralytics.nn.modules import *
+    >>> import torch
+    >>> import os
+    >>> x = torch.ones(1, 128, 40, 40)
+    >>> m = Conv(128, 128)
+    >>> f = f"{m._get_name()}.onnx"
+    >>> torch.onnx.export(m, x, f)
+    >>> os.system(f"onnxslim {f} {f} && open {f}")  # pip install onnxslim
 """
 
-from .adaptor import LightweightAdaptor
+from .adaptor import Adaptor
 from .block import (
     C1,
     C2,
@@ -31,6 +31,7 @@ from .block import (
     SPP,
     SPPELAN,
     SPPF,
+    A2C2f,
     AConv,
     ADown,
     Attention,
@@ -58,7 +59,6 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
-    A2C2f,
 )
 from .conv import (
     CBAM,
@@ -77,7 +77,6 @@ from .conv import (
     SpatialAttention,
 )
 from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
-from .tta import TTAMixin, TTAStrategy
 from .transformer import (
     AIFI,
     MLP,
@@ -164,7 +163,5 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
-    "LightweightAdaptor",
-    "TTAMixin",
-    "TTAStrategy",
+    "Adaptor"
 )

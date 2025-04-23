@@ -66,6 +66,23 @@ classes: # (int | list[int], optional) filter results by class, i.e. classes=0, 
 retina_masks: False # (bool) use high-resolution segmentation masks
 embed: # (list[int], optional) return feature vectors/embeddings from given layers
 
+# TTA settings ---------------------------------------------------------------------------------------------------------
+tta: False # (bool) enable Test-Time Adaptation during prediction
+tta_steps: 5 # (int) DEPRECATED/UNUSED in FeatureAlignmentLoss. Number of optimization steps (if using simpler TTA methods)
+tta_lr: 0.001 # (float) learning rate for TTA optimizer (Adam)
+tta_optimizer: Adam # (str) optimizer for TTA, choices=[Adam, SGD]. Currently hardcoded to Adam in Predictor.
+tta_criterion: FeatureAlignmentLoss # (str) loss function for TTA, choices=[EntropyLoss, FeatureAlignmentLoss]. Predictor uses FeatureAlignmentLoss.
+tta_feature_layer: 0 # (int) Index of the layer from which to extract features for TTA loss calculation (both online and offline)
+tta_conf_threshold: 0.5 # (float) Confidence threshold for using predicted boxes' features in TTA loss (online)
+tta_bn_only: True # (bool) TTA updates only BatchNorm layers (True) or Adaptor layers (False) (online)
+tta_alpha: 0.01 # (float) EMA decay factor for test feature statistics in FeatureAlignmentLoss (online)
+tta_alpha_ema_loss: 0.01 # (float) EMA decay factor for L_img loss component in FeatureAlignmentLoss (online)
+tta_tau1: 1.1 # (float) Threshold 1 for TTA update decision in FeatureAlignmentLoss (online)
+tta_tau2: 1.05 # (float) Threshold 2 for TTA update decision in FeatureAlignmentLoss (online)
+calculate_tta_stats: False # (bool) Calculate and save TTA statistics (mean, variance) after training finishes
+tta_stat_samples: 2000 # (int) Number of training samples to use for calculating TTA stats (offline)
+tta_epsilon: 1e-9 # (float) Small value added to variance before inversion for numerical stability (offline)
+
 # Visualize settings ---------------------------------------------------------------------------------------------------
 show: False # (bool) show predicted images and videos if environment allows
 save_frames: False # (bool) save predicted individual video frames
@@ -95,7 +112,7 @@ momentum: 0.937 # (float) SGD momentum/Adam beta1
 weight_decay: 0.0005 # (float) optimizer weight decay 5e-4
 warmup_epochs: 3.0 # (float) warmup epochs (fractions ok)
 warmup_momentum: 0.8 # (float) warmup initial momentum
-warmup_bias_lr: 0.0 # 0.1 # (float) warmup initial bias lr
+warmup_bias_lr: 0.1 # (float) warmup initial bias lr
 box: 7.5 # (float) box loss gain
 cls: 0.5 # (float) cls loss gain (scale with pixels)
 dfl: 1.5 # (float) dfl loss gain
@@ -113,11 +130,9 @@ perspective: 0.0 # (float) image perspective (+/- fraction), range 0-0.001
 flipud: 0.0 # (float) image flip up-down (probability)
 fliplr: 0.5 # (float) image flip left-right (probability)
 bgr: 0.0 # (float) image channel BGR (probability)
-
 mosaic: 1.0 # (float) image mosaic (probability)
 mixup: 0.0 # (float) image mixup (probability)
-copy_paste: 0.1 # (float) segment copy-paste (probability)
-
+copy_paste: 0.0 # (float) segment copy-paste (probability)
 copy_paste_mode: "flip" # (str) the method to do copy_paste augmentation (flip, mixup)
 auto_augment: randaugment # (str) auto augmentation policy for classification (randaugment, autoaugment, augmix)
 erasing: 0.4 # (float) probability of random erasing during classification training (0-0.9), 0 means no erasing, must be less than 1.0.
@@ -128,13 +143,3 @@ cfg: # (str, optional) for overriding defaults.yaml
 
 # Tracker settings ------------------------------------------------------------------------------------------------------
 tracker: botsort.yaml # (str) tracker type, choices=[botsort.yaml, bytetrack.yaml]
-
-# Test-Time Adaptation settings ---------------------------------------------------------------------------------------
-tta: False # (bool) enable Test-Time Adaptation during prediction
-tta_alpha: 0.01 # (float) EMA update rate for TTA
-tta_tau1: 1.1 # (float) primary threshold for detecting major distribution shifts
-tta_tau2: 1.05 # (float) secondary threshold for detecting minor distribution shifts
-tta_momentum: 0.99 # (float) momentum for EMA updates
-tta_reduction_ratio: 32 # (int) reduction ratio for adaptors
-tta_lr: 0.001 # (float) learning rate for TTA updates
-tta_feature_layer: -3 # (int) index of the layer to extract features from

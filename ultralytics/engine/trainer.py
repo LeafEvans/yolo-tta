@@ -3,7 +3,7 @@
 Train a model on a dataset.
 
 Usage:
-    $ yolo mode=train model=yolov8n.pt data=coco8.yaml imgsz=640 epochs=100 batch=16
+    $ yolo mode=train model=yolo11n.pt data=coco8.yaml imgsz=640 epochs=100 batch=16
 """
 
 import gc
@@ -15,6 +15,7 @@ import warnings
 from copy import copy, deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -52,6 +53,7 @@ from ultralytics.utils.torch_utils import (
     select_device,
     strip_optimizer,
     torch_distributed_zero_first,
+    unset_deterministic,
 )
 
 
@@ -88,17 +90,26 @@ class BaseTrainer:
         tloss (float): Total loss value.
         loss_names (list): List of loss names.
         csv (Path): Path to results CSV file.
+        metrics (dict): Dictionary of metrics.
+        plots (dict): Dictionary of plots.
     """
 
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
         """
-        Initializes the BaseTrainer class.
+        Initialize the BaseTrainer class.
 
         Args:
             cfg (str, optional): Path to a configuration file. Defaults to DEFAULT_CFG.
             overrides (dict, optional): Configuration overrides. Defaults to None.
+            _callbacks (list, optional): List of callback functions. Defaults to None.
         """
         self.args = get_cfg(cfg, overrides)
+
+        self.args.calculate_tta_stats = getattr(self.args, "calculate_tta_stats", False)
+        self.args.tta_stat_samples = getattr(self.args, "tta_stat_samples", 2000)
+        self.args.tta_feature_layer = getattr(self.args, "tta_feature_layer", -1)
+        self.args.tta_epsilon = getattr(self.args, "tta_epsilon", 1e-9)
+
         self.check_resume(overrides)
         self.device = select_device(self.args.device, self.args.batch)
         self.validator = None
@@ -128,7 +139,7 @@ class BaseTrainer:
             self.args.workers = 0  # faster CPU training as time dominated by inference, not dataloading
 
         # Model and Dataset
-        self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolov8n -> yolov8n.pt
+        self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolo11n -> yolo11n.pt
         with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
             self.trainset, self.testset = self.get_dataset()
         self.ema = None
@@ -155,11 +166,11 @@ class BaseTrainer:
             callbacks.add_integration_callbacks(self)
 
     def add_callback(self, event: str, callback):
-        """Appends the given callback."""
+        """Append the given callback to the event's callback list."""
         self.callbacks[event].append(callback)
 
     def set_callback(self, event: str, callback):
-        """Overrides the existing callbacks with the given callback."""
+        """Override the existing callbacks with the given callback for the specified event."""
         self.callbacks[event] = [callback]
 
     def run_callbacks(self, event: str):
@@ -215,7 +226,7 @@ class BaseTrainer:
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)
 
     def _setup_ddp(self, world_size):
-        """Initializes and sets the DistributedDataParallel parameters for training."""
+        """Initialize and set the DistributedDataParallel parameters for training."""
         torch.cuda.set_device(RANK)
         self.device = torch.device("cuda", RANK)
         # LOGGER.info(f'DDP info: RANK {RANK}, WORLD_SIZE {world_size}, DEVICE {self.device}')
@@ -228,7 +239,7 @@ class BaseTrainer:
         )
 
     def _setup_train(self, world_size):
-        """Builds dataloaders and optimizer on correct rank process."""
+        """Build dataloaders and optimizer on correct rank process."""
         # Model
         self.run_callbacks("on_pretrain_routine_start")
         ckpt = self.setup_model()
@@ -271,7 +282,6 @@ class BaseTrainer:
         )
         if world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
-            self.set_model_attributes()  # set again after DDP wrapper
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
@@ -317,7 +327,20 @@ class BaseTrainer:
         self.run_callbacks("on_pretrain_routine_end")
 
     def _do_train(self, world_size=1):
-        """Train completed, evaluate and plot if specified by arguments."""
+        """
+        Train the model using iterative epochs with optional distributed processing.
+
+        Parameters:
+            world_size (int): Number of processes for distributed training (default is 1).
+
+        This method sets up the training environment including distributed data parallel if needed,
+        configures training and learning rate schedulers, manages warmup phases, and iterates over the
+        training data batches to perform forward and backward passes with gradient accumulation. It also
+        handles logging, validation, model saving, early stopping criteria (based on epochs, runtime, or
+        custom conditions), and final evaluation. Upon completion, it ensures proper cleanup and resource
+        deallocation.
+        """
+        """Train the model with the specified world size."""
         if world_size > 1:
             self._setup_ddp(world_size)
         self._setup_train(world_size)
@@ -452,7 +475,8 @@ class BaseTrainer:
                 self.scheduler.last_epoch = self.epoch  # do not move
                 self.stop |= epoch >= self.epochs  # stop if exceeded epochs
             self.run_callbacks("on_fit_epoch_end")
-            self._clear_memory()
+            if self._get_memory(fraction=True) > 0.9:
+                self._clear_memory()  # clear if memory utilization > 90%
 
             # Early Stopping
             if RANK != -1:  # if DDP training
@@ -470,12 +494,19 @@ class BaseTrainer:
             self.final_eval()
             if self.args.plots:
                 self.plot_metrics()
+            if self.args.calculate_tta_stats:
+                LOGGER.info("Calculating TTA statistics...")
+                try:
+                    self._calculate_and_save_tta_stats()
+                except Exception as e:
+                    LOGGER.error(f"Failed to calculate TTA statistics: {e}", exc_info=True)
             self.run_callbacks("on_train_end")
         self._clear_memory()
+        unset_deterministic()
         self.run_callbacks("teardown")
 
     def auto_batch(self, max_num_obj=0):
-        """Get batch size by calculating memory occupation of model."""
+        """Calculate optimal batch size based on model and device memory constraints."""
         return check_train_batch_size(
             model=self.model,
             imgsz=self.args.imgsz,
@@ -484,18 +515,23 @@ class BaseTrainer:
             max_num_obj=max_num_obj,
         )  # returns batch size
 
-    def _get_memory(self):
-        """Get accelerator memory utilization in GB."""
+    def _get_memory(self, fraction=False):
+        """Get accelerator memory utilization in GB or as a fraction of total memory."""
+        memory, total = 0, 0
         if self.device.type == "mps":
             memory = torch.mps.driver_allocated_memory()
+            if fraction:
+                return __import__("psutil").virtual_memory().percent / 100
         elif self.device.type == "cpu":
-            memory = 0
+            pass
         else:
             memory = torch.cuda.memory_reserved()
-        return memory / 1e9
+            if fraction:
+                total = torch.cuda.get_device_properties(self.device).total_memory
+        return ((memory / total) if total > 0 else 0) if fraction else (memory / 2**30)
 
     def _clear_memory(self):
-        """Clear accelerator memory on different platforms."""
+        """Clear accelerator memory by calling garbage collector and emptying cache."""
         gc.collect()
         if self.device.type == "mps":
             torch.mps.empty_cache()
@@ -505,7 +541,7 @@ class BaseTrainer:
             torch.cuda.empty_cache()
 
     def read_results_csv(self):
-        """Read results.csv into a dict using pandas."""
+        """Read results.csv into a dictionary using pandas."""
         import pandas as pd  # scope for faster 'import ultralytics'
 
         return pd.read_csv(self.csv).to_dict(orient="list")
@@ -547,9 +583,10 @@ class BaseTrainer:
 
     def get_dataset(self):
         """
-        Get train, val path from data dict if it exists.
+        Get train and validation datasets from data dictionary.
 
-        Returns None if data format is not recognized.
+        Returns:
+            (tuple): A tuple containing the training and validation/test datasets.
         """
         try:
             if self.args.task == "classify":
@@ -566,10 +603,19 @@ class BaseTrainer:
         except Exception as e:
             raise RuntimeError(emojis(f"Dataset '{clean_url(self.args.data)}' error ❌ {e}")) from e
         self.data = data
+        if self.args.single_cls:
+            LOGGER.info("Overriding class names with single class.")
+            self.data["names"] = {0: "item"}
+            self.data["nc"] = 1
         return data["train"], data.get("val") or data.get("test")
 
     def setup_model(self):
-        """Load/create/download model for any task."""
+        """
+        Load, create, or download model for any task.
+
+        Returns:
+            (dict): Optional checkpoint to resume training from.
+        """
         if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
             return
 
@@ -599,9 +645,10 @@ class BaseTrainer:
 
     def validate(self):
         """
-        Runs validation on test set using self.validator.
+        Run validation on test set using self.validator.
 
-        The returned dict is expected to contain "fitness" key.
+        Returns:
+            (tuple): A tuple containing metrics dictionary and fitness score.
         """
         metrics = self.validator(self)
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
@@ -635,7 +682,7 @@ class BaseTrainer:
         return {"loss": loss_items} if loss_items is not None else ["loss"]
 
     def set_model_attributes(self):
-        """To set or update model parameters before training."""
+        """Set or update model parameters before training."""
         self.model.names = self.data["names"]
 
     def build_targets(self, preds, targets):
@@ -656,12 +703,12 @@ class BaseTrainer:
         pass
 
     def save_metrics(self, metrics):
-        """Saves training metrics to a CSV file."""
+        """Save training metrics to a CSV file."""
         keys, vals = list(metrics.keys()), list(metrics.values())
         n = len(metrics) + 2  # number of cols
         s = "" if self.csv.exists() else (("%s," * n % tuple(["epoch", "time"] + keys)).rstrip(",") + "\n")  # header
         t = time.time() - self.train_time_start
-        with open(self.csv, "a") as f:
+        with open(self.csv, "a", encoding="utf-8") as f:
             f.write(s + ("%.6g," * n % tuple([self.epoch + 1, t] + vals)).rstrip(",") + "\n")
 
     def plot_metrics(self):
@@ -674,7 +721,7 @@ class BaseTrainer:
         self.plots[path] = {"data": data, "timestamp": time.time()}
 
     def final_eval(self):
-        """Performs final evaluation and validation for object detection YOLO model."""
+        """Perform final evaluation and validation for object detection YOLO model."""
         ckpt = {}
         for f in self.last, self.best:
             if f.exists():
@@ -758,8 +805,7 @@ class BaseTrainer:
 
     def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         """
-        Constructs an optimizer for the given model, based on the specified optimizer name, learning rate, momentum,
-        weight decay, and number of iterations.
+        Construct an optimizer for the given model.
 
         Args:
             model (torch.nn.Module): The model for which to build an optimizer.
@@ -782,7 +828,7 @@ class BaseTrainer:
                 f"ignoring 'lr0={self.args.lr0}' and 'momentum={self.args.momentum}' and "
                 f"determining best 'optimizer', 'lr0' and 'momentum' automatically... "
             )
-            nc = getattr(model, "nc", 10)  # number of classes
+            nc = self.data.get("nc", 10)  # number of classes
             lr_fit = round(0.002 * 5 / (4 + nc), 6)  # lr0 fit equation to 6 decimal places
             name, lr, momentum = ("SGD", 0.01, 0.9) if iterations > 10000 else ("AdamW", lr_fit, 0.9)
             self.args.warmup_bias_lr = 0.0  # no higher than 0.01 for Adam
@@ -818,3 +864,217 @@ class BaseTrainer:
             f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias(decay=0.0)"
         )
         return optimizer
+
+    def _calculate_and_save_tta_stats(self):
+        """
+        Calculate and save statistics (mean, inv_variance) for TTA based on training data features.
+        This method iterates through a subset of the training data, extracts features using
+        the trained model (EMA if available), computes statistics, and saves them.
+        """
+        if not hasattr(self, "train_loader"):
+            LOGGER.error("Training dataloader not found, cannot calculate TTA stats.")
+            return
+        if not hasattr(self, "data") or "nc" not in self.data:
+            LOGGER.error("Dataset information (number of classes) not found, cannot calculate TTA stats.")
+            return
+
+        # Validate epsilon type (essential robustness check)
+        try:
+            epsilon = float(self.args.tta_epsilon)
+        except (ValueError, TypeError):
+            LOGGER.warning(f"Invalid value for tta_epsilon ('{self.args.tta_epsilon}'). Using default 1e-9.")
+            epsilon = 1e-9
+
+        model_to_use = self.ema.ema if self.ema else self.model
+        model_to_use.eval()
+
+        stats_batch_size = self.train_loader.batch_size if self.train_loader.batch_size else 1
+        num_samples_to_process = min(self.args.tta_stat_samples, len(self.train_loader.dataset))
+        num_batches_to_process = math.ceil(num_samples_to_process / stats_batch_size) if stats_batch_size > 0 else 0
+
+        if num_batches_to_process == 0:
+            LOGGER.warning("No batches to process for TTA stats calculation.")
+            return
+
+        LOGGER.info(
+            f"Processing up to {num_samples_to_process} samples "
+            f"({num_batches_to_process} batches of size {stats_batch_size}) for TTA stats..."
+        )
+
+        all_F_img = []
+        all_F_obj_dict_gt = defaultdict(list)
+        processed_samples = 0
+
+        with torch.no_grad():
+            pbar = TQDM(enumerate(self.train_loader), total=num_batches_to_process, desc="Calculating TTA Stats")
+            for i, batch in pbar:
+                if processed_samples >= num_samples_to_process:
+                    break
+
+                batch = self.preprocess_batch(batch)
+                F_img, F_obj_dict_gt = None, None  # Initialize for safety
+                try:
+                    # Feature extraction requires try-except for NotImplementedError and potential batch errors
+                    F_img, F_obj_dict_gt = self._extract_features_for_tta(
+                        model_to_use, batch, feature_layer_idx=self.args.tta_feature_layer
+                    )
+                except NotImplementedError:
+                    LOGGER.error("'_extract_features_for_tta' must be implemented by task-specific trainer subclass.")
+                    model_to_use.train()  # Restore train mode before returning
+                    return  # Cannot proceed without implementation
+                except Exception as e:
+                    LOGGER.error(f"Error during feature extraction in batch {i}: {e}", exc_info=True)
+                    # Continue to next batch, F_img/F_obj_dict_gt remain None or previous value (hence initialization)
+
+                # Accumulate valid features (moved to CPU)
+                if F_img is not None and F_img.numel() > 0:
+                    all_F_img.append(F_img.detach().cpu())
+
+                if F_obj_dict_gt is not None:
+                    for cls_idx, features in F_obj_dict_gt.items():
+                        if features is not None and features.numel() > 0:
+                            all_F_obj_dict_gt[cls_idx].append(features.detach().cpu())
+
+                current_batch_size = batch["img"].shape[0]
+                processed_samples += current_batch_size
+                pbar.set_postfix({"Processed Samples": min(processed_samples, num_samples_to_process)})
+
+        # Statistics Calculation
+        tta_stats = {}
+        nc = self.data["nc"]
+
+        # Image-level stats
+        if all_F_img:
+            F_img_all = torch.cat(all_F_img, dim=0)
+            # Limit to the exact number of samples requested
+            if F_img_all.shape[0] > num_samples_to_process:
+                F_img_all = F_img_all[:num_samples_to_process]
+
+            if F_img_all.numel() > 0:
+                mu_img = F_img_all.mean(dim=0)
+                var_img = torch.clamp(F_img_all.var(dim=0, unbiased=True), min=0.0)
+                tta_stats["mu_img"] = mu_img
+                tta_stats["inv_sigma_sq_img"] = 1.0 / (var_img + epsilon)
+                LOGGER.info(f"Calculated image-level stats from {F_img_all.shape[0]} samples.")
+            else:
+                LOGGER.warning("No valid image-level features collected.")
+        else:
+            LOGGER.warning("No image-level features collected.")
+
+        # Object-level stats
+        mu_obj_dict = {}
+        inv_sigma_sq_obj_dict = {}
+        obj_counts_per_class = {}
+        actual_total_obj_count = 0
+        valid_F_obj_dict_gt_cat = {}  # Store concatenated features per class
+
+        for cls_idx in range(nc):
+            if all_F_obj_dict_gt[cls_idx]:
+                concatenated_features = torch.cat(all_F_obj_dict_gt[cls_idx], dim=0)
+                if concatenated_features.numel() > 0:
+                    valid_F_obj_dict_gt_cat[cls_idx] = concatenated_features
+                    count = concatenated_features.shape[0]
+                    obj_counts_per_class[cls_idx] = count
+                    actual_total_obj_count += count
+                    mu_obj_dict[cls_idx] = concatenated_features.mean(dim=0)
+                    var_obj_cls = torch.clamp(concatenated_features.var(dim=0, unbiased=True), min=0.0)
+                    inv_sigma_sq_obj_dict[cls_idx] = 1.0 / (var_obj_cls + epsilon)
+                else:
+                    obj_counts_per_class[cls_idx] = 0
+            else:
+                obj_counts_per_class[cls_idx] = 0
+
+        if actual_total_obj_count > 0:
+            pi_obj = torch.zeros(nc)
+            for cls_idx in range(nc):
+                pi_obj[cls_idx] = obj_counts_per_class.get(cls_idx, 0) / actual_total_obj_count
+
+            tta_stats["mu_obj_dict"] = mu_obj_dict
+            tta_stats["inv_sigma_sq_obj_dict"] = inv_sigma_sq_obj_dict
+            tta_stats["pi_obj"] = pi_obj
+            LOGGER.info(
+                f"Calculated object-level stats for {len(mu_obj_dict)} classes from {actual_total_obj_count} objects."
+            )
+        else:
+            LOGGER.warning("No object-level features collected.")
+
+        # D_in_KL calculation (requires both image and object stats)
+        img_stats_ok = "mu_img" in tta_stats and "inv_sigma_sq_img" in tta_stats
+        obj_stats_ok = (
+            "mu_obj_dict" in tta_stats
+            and "inv_sigma_sq_obj_dict" in tta_stats
+            and "pi_obj" in tta_stats
+            and len(mu_obj_dict) > 0
+        )
+
+        if img_stats_ok and obj_stats_ok:
+            mu_img = tta_stats["mu_img"]
+            inv_sigma_sq_img = tta_stats["inv_sigma_sq_img"]
+            sigma_sq_img = 1.0 / (inv_sigma_sq_img + epsilon)
+            img_feat_dim = mu_img.shape[0]
+            obj_feat_dim = next((v.shape[0] for v in mu_obj_dict.values()), None)  # Get dim from first available class
+
+            if obj_feat_dim is None:
+                LOGGER.warning("Could not determine object feature dimension. Skipping D_in_KL.")
+            elif img_feat_dim != obj_feat_dim:
+                LOGGER.warning(
+                    f"Feature dimensions mismatch (img:{img_feat_dim}, obj:{obj_feat_dim}). Skipping D_in_KL."
+                )
+            else:
+                D_in_KL = 0.0
+                device = mu_img.device  # Should be CPU
+                sigma_sq_img = sigma_sq_img.to(device)
+
+                for cls_idx in range(nc):
+                    if cls_idx in mu_obj_dict:
+                        mu_obj_cls = mu_obj_dict[cls_idx].to(device)
+                        inv_sigma_sq_obj_cls = inv_sigma_sq_obj_dict[cls_idx].to(device)
+                        sigma_sq_obj_cls = 1.0 / (inv_sigma_sq_obj_cls + epsilon)
+                        pi_cls = tta_stats["pi_obj"][cls_idx].to(device)
+
+                        # KL divergence calculation with stability additions
+                        term1 = torch.log((sigma_sq_img + epsilon) / (sigma_sq_obj_cls + epsilon)).sum()
+                        term2 = ((sigma_sq_obj_cls + (mu_obj_cls - mu_img) ** 2) / (sigma_sq_img + epsilon)).sum()
+                        kl_div_cls = 0.5 * (term1 + term2 - img_feat_dim)
+                        D_in_KL += pi_cls * torch.clamp(kl_div_cls, min=0.0)
+
+                tta_stats["D_in_KL"] = D_in_KL.cpu()  # Ensure final result is on CPU
+                LOGGER.info(f"Calculated D_in_KL: {D_in_KL:.4f}")
+        else:
+            LOGGER.warning("Skipping D_in_KL due to missing image or object statistics.")
+
+        # Save Statistics (essential to keep try-except for file I/O)
+        if not tta_stats:
+            LOGGER.error("No TTA statistics were calculated. Nothing to save.")
+        else:
+            save_path = self.save_dir / "tta_stats.pt"
+            try:
+                # Ensure all tensors are on CPU before saving (already done during accumulation/calculation)
+                torch.save(tta_stats, save_path)
+                LOGGER.info(f"Successfully saved TTA statistics to {save_path}")
+            except Exception as e:
+                LOGGER.error(f"Failed to save TTA statistics to {save_path}: {e}", exc_info=True)
+
+        # Clean up memory and restore model state
+        self._clear_memory()
+        model_to_use.train()
+
+    def _extract_features_for_tta(self, model, batch, feature_layer_idx=-1):
+        """
+        Placeholder method for extracting features for TTA statistics calculation.
+        This method MUST be implemented by subclasses (e.g., DetectionTrainer).
+
+        Args:
+            model (nn.Module): The model (usually EMA) to use for feature extraction.
+            batch (dict): The input batch data.
+            feature_layer_idx (int): Index of the layer to extract features from.
+
+        Returns:
+            tuple(torch.Tensor | None, dict | None):
+                - F_img (torch.Tensor): Image-level features (N, feature_dim).
+                - F_obj_dict_gt (dict): {class_idx: torch.Tensor(N_obj, feature_dim)} GT-based object-level features.
+
+        Raises:
+            NotImplementedError: If the subclass does not implement this method.
+        """
+        raise NotImplementedError("_extract_features_for_tta must be implemented by task-specific trainer subclass.")

@@ -26,7 +26,7 @@ class VarifocalLoss(nn.Module):
 
     @staticmethod
     def forward(pred_score, gt_score, label, alpha=0.75, gamma=2.0):
-        """Computes varfocal loss."""
+        """Compute varfocal loss between predictions and ground truth."""
         weight = alpha * pred_score.sigmoid().pow(gamma) * (1 - label) + gt_score * label
         with autocast(enabled=False):
             loss = (
@@ -41,12 +41,12 @@ class FocalLoss(nn.Module):
     """Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)."""
 
     def __init__(self):
-        """Initializer for FocalLoss class with no parameters."""
+        """Initialize FocalLoss class with no parameters."""
         super().__init__()
 
     @staticmethod
     def forward(pred, label, gamma=1.5, alpha=0.25):
-        """Calculates and updates confusion matrix for object detection/classification tasks."""
+        """Calculate focal loss with modulating factors for class imbalance."""
         loss = F.binary_cross_entropy_with_logits(pred, label, reduction="none")
         # p_t = torch.exp(-loss)
         # loss *= self.alpha * (1.000001 - p_t) ** self.gamma  # non-zero power for gradient stability
@@ -63,20 +63,15 @@ class FocalLoss(nn.Module):
 
 
 class DFLoss(nn.Module):
-    """Criterion class for computing DFL losses during training."""
+    """Criterion class for computing Distribution Focal Loss (DFL)."""
 
     def __init__(self, reg_max=16) -> None:
-        """Initialize the DFL module."""
+        """Initialize the DFL module with regularization maximum."""
         super().__init__()
         self.reg_max = reg_max
 
     def __call__(self, pred_dist, target):
-        """
-        Return sum of left and right DFL losses.
-
-        Distribution Focal Loss (DFL) proposed in Generalized Focal Loss
-        https://ieeexplore.ieee.org/document/9792391
-        """
+        """Return sum of left and right DFL losses from https://ieeexplore.ieee.org/document/9792391."""
         target = target.clamp_(0, self.reg_max - 1 - 0.01)
         tl = target.long()  # target left
         tr = tl + 1  # target right
@@ -89,7 +84,7 @@ class DFLoss(nn.Module):
 
 
 class BboxLoss(nn.Module):
-    """Criterion class for computing training losses during training."""
+    """Criterion class for computing training losses for bounding boxes."""
 
     def __init__(self, reg_max=16):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
@@ -97,7 +92,7 @@ class BboxLoss(nn.Module):
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
 
     def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
-        """IoU loss."""
+        """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
@@ -114,14 +109,14 @@ class BboxLoss(nn.Module):
 
 
 class RotatedBboxLoss(BboxLoss):
-    """Criterion class for computing training losses during training."""
+    """Criterion class for computing training losses for rotated bounding boxes."""
 
     def __init__(self, reg_max):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__(reg_max)
 
     def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
-        """IoU loss."""
+        """Compute IoU and DFL losses for rotated bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
@@ -138,15 +133,15 @@ class RotatedBboxLoss(BboxLoss):
 
 
 class KeypointLoss(nn.Module):
-    """Criterion class for computing training losses."""
+    """Criterion class for computing keypoint losses."""
 
     def __init__(self, sigmas) -> None:
-        """Initialize the KeypointLoss class."""
+        """Initialize the KeypointLoss class with keypoint sigmas."""
         super().__init__()
         self.sigmas = sigmas
 
     def forward(self, pred_kpts, gt_kpts, kpt_mask, area):
-        """Calculates keypoint loss factor and Euclidean distance loss for predicted and actual keypoints."""
+        """Calculate keypoint loss factor and Euclidean distance loss for keypoints."""
         d = (pred_kpts[..., 0] - gt_kpts[..., 0]).pow(2) + (pred_kpts[..., 1] - gt_kpts[..., 1]).pow(2)
         kpt_loss_factor = kpt_mask.shape[1] / (torch.sum(kpt_mask != 0, dim=1) + 1e-9)
         # e = d / (2 * (area * self.sigmas) ** 2 + 1e-9)  # from formula
@@ -155,10 +150,10 @@ class KeypointLoss(nn.Module):
 
 
 class v8DetectionLoss:
-    """Criterion class for computing training losses."""
+    """Criterion class for computing training losses for YOLOv8 object detection."""
 
     def __init__(self, model, tal_topk=10):  # model must be de-paralleled
-        """Initializes v8DetectionLoss with the model, defining model-related properties and BCE loss function."""
+        """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
 
@@ -178,7 +173,7 @@ class v8DetectionLoss:
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets, batch_size, scale_tensor):
-        """Preprocesses the target counts and matches with the input batch size to output a tensor."""
+        """Preprocess targets by converting to tensor format and scaling coordinates."""
         nl, ne = targets.shape
         if nl == 0:
             out = torch.zeros(batch_size, 0, ne - 1, device=self.device)
@@ -261,15 +256,15 @@ class v8DetectionLoss:
 
 
 class v8SegmentationLoss(v8DetectionLoss):
-    """Criterion class for computing training losses."""
+    """Criterion class for computing training losses for YOLOv8 segmentation."""
 
     def __init__(self, model):  # model must be de-paralleled
-        """Initializes the v8SegmentationLoss class, taking a de-paralleled model as argument."""
+        """Initialize the v8SegmentationLoss class with model parameters and mask overlap setting."""
         super().__init__(model)
         self.overlap = model.args.overlap_mask
 
     def __call__(self, preds, batch):
-        """Calculate and return the loss for the YOLO model."""
+        """Calculate and return the combined loss for detection and segmentation."""
         loss = torch.zeros(4, device=self.device)  # box, cls, dfl
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
@@ -297,7 +292,7 @@ class v8SegmentationLoss(v8DetectionLoss):
             raise TypeError(
                 "ERROR ❌ segment dataset incorrectly formatted or not a segment dataset.\n"
                 "This error can occur when incorrectly training a 'segment' model on a 'detect' dataset, "
-                "i.e. 'yolo train model=yolov8n-seg.pt data=coco8.yaml'.\nVerify your dataset is a "
+                "i.e. 'yolo train model=yolo11n-seg.pt data=coco8.yaml'.\nVerify your dataset is a "
                 "correctly formatted 'segment' dataset using 'data=coco8-seg.yaml' "
                 "as an example.\nSee https://docs.ultralytics.com/datasets/segment/ for help."
             ) from e
@@ -444,10 +439,10 @@ class v8SegmentationLoss(v8DetectionLoss):
 
 
 class v8PoseLoss(v8DetectionLoss):
-    """Criterion class for computing training losses."""
+    """Criterion class for computing training losses for YOLOv8 pose estimation."""
 
     def __init__(self, model):  # model must be de-paralleled
-        """Initializes v8PoseLoss with model, sets keypoint variables and declares a keypoint loss instance."""
+        """Initialize v8PoseLoss with model parameters and keypoint-specific loss functions."""
         super().__init__(model)
         self.kpt_shape = model.model[-1].kpt_shape
         self.bce_pose = nn.BCEWithLogitsLoss()
@@ -457,7 +452,7 @@ class v8PoseLoss(v8DetectionLoss):
         self.keypoint_loss = KeypointLoss(sigmas=sigmas)
 
     def __call__(self, preds, batch):
-        """Calculate the total loss and detach it."""
+        """Calculate the total loss and detach it for pose estimation."""
         loss = torch.zeros(5, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -524,7 +519,7 @@ class v8PoseLoss(v8DetectionLoss):
 
     @staticmethod
     def kpts_decode(anchor_points, pred_kpts):
-        """Decodes predicted keypoints to image coordinates."""
+        """Decode predicted keypoints to image coordinates."""
         y = pred_kpts.clone()
         y[..., :2] *= 2.0
         y[..., 0] += anchor_points[:, [0]] - 0.5
@@ -580,7 +575,7 @@ class v8PoseLoss(v8DetectionLoss):
         )
 
         # Divide coordinates by stride
-        selected_keypoints /= stride_tensor.view(1, -1, 1, 1)
+        selected_keypoints[..., :2] /= stride_tensor.view(1, -1, 1, 1)
 
         kpts_loss = 0
         kpts_obj_loss = 0
@@ -599,7 +594,7 @@ class v8PoseLoss(v8DetectionLoss):
 
 
 class v8ClassificationLoss:
-    """Criterion class for computing training losses."""
+    """Criterion class for computing training losses for classification."""
 
     def __call__(self, preds, batch):
         """Compute the classification loss between predictions and true labels."""
@@ -613,13 +608,13 @@ class v8OBBLoss(v8DetectionLoss):
     """Calculates losses for object detection, classification, and box distribution in rotated YOLO models."""
 
     def __init__(self, model):
-        """Initializes v8OBBLoss with model, assigner, and rotated bbox loss; note model must be de-paralleled."""
+        """Initialize v8OBBLoss with model, assigner, and rotated bbox loss; model must be de-paralleled."""
         super().__init__(model)
         self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
 
     def preprocess(self, targets, batch_size, scale_tensor):
-        """Preprocesses the target counts and matches with the input batch size to output a tensor."""
+        """Preprocess targets for oriented bounding box detection."""
         if targets.shape[0] == 0:
             out = torch.zeros(batch_size, 0, 6, device=self.device)
         else:
@@ -636,7 +631,7 @@ class v8OBBLoss(v8DetectionLoss):
         return out
 
     def __call__(self, preds, batch):
-        """Calculate and return the loss for the YOLO model."""
+        """Calculate and return the loss for oriented bounding box detection."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
         batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
@@ -666,7 +661,7 @@ class v8OBBLoss(v8DetectionLoss):
             raise TypeError(
                 "ERROR ❌ OBB dataset incorrectly formatted or not a OBB dataset.\n"
                 "This error can occur when incorrectly training a 'OBB' model on a 'detect' dataset, "
-                "i.e. 'yolo train model=yolov8n-obb.pt data=dota8.yaml'.\nVerify your dataset is a "
+                "i.e. 'yolo train model=yolo11n-obb.pt data=dota8.yaml'.\nVerify your dataset is a "
                 "correctly formatted 'OBB' dataset using 'data=dota8.yaml' "
                 "as an example.\nSee https://docs.ultralytics.com/datasets/obb/ for help."
             ) from e
@@ -726,7 +721,7 @@ class v8OBBLoss(v8DetectionLoss):
 
 
 class E2EDetectLoss:
-    """Criterion class for computing training losses."""
+    """Criterion class for computing training losses for end-to-end detection."""
 
     def __init__(self, model):
         """Initialize E2EDetectLoss with one-to-many and one-to-one detection losses using the provided model."""
@@ -741,3 +736,157 @@ class E2EDetectLoss:
         one2one = preds["one2one"]
         loss_one2one = self.one2one(one2one, batch)
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
+
+
+class FeatureAlignmentLoss(nn.Module):
+    """
+    FeatureAlignmentLoss implements a loss function that aligns incoming test features
+    with precomputed feature statistics via a KL divergence measure. It handles both image
+    and object features, updating their exponentially weighted moving averages (EMA) and
+    computing loss accordingly.
+
+    Parameters:
+        nc (int): Number of classes or feature channels.
+        feat_stats (dict): Dictionary containing precomputed feature statistics.
+        alpha (float, optional): EMA smoothing factor for test feature mean updates (default is 0.01).
+        alpha_ema_loss (float, optional): EMA smoothing factor for the loss update (default is 0.01).
+        D_in_KL (float, optional): Baseline constant used in KL divergence normalization (default is 0.5).
+        tau1 (float, optional): Threshold 1 for update decision (default is 1.1).
+        tau2 (float, optional): Threshold 2 for update decision (default is 1.05).
+
+    Attributes:
+        mu_img (Tensor): Reference mean image feature.
+        inv_sigma_sq_img (Tensor): Inverse variance for image features.
+        mu_obj_dict (ParameterDict): Object feature means.
+        inv_sigma_sq_obj_dict (ParameterDict): Object feature inverse variances.
+        mu_te_img_ema (Tensor): EMA of test image feature means.
+        mu_te_obj_ema (ParameterDict): EMA of test object feature means.
+        L_ema (Tensor): EMA of the image loss.
+        _zero (Tensor): Registered buffer for zero tensor.
+    """
+
+    def __init__(self, nc, feat_stats, alpha=0.01, alpha_ema_loss=0.01, D_in_KL=0.5, tau1=1.1, tau2=1.05):
+        super().__init__()
+        self.nc = nc
+        self.alpha = alpha
+        self.alpha_ema_loss = alpha_ema_loss
+        self.tau1 = tau1
+        self.tau2 = tau2
+        self.first_batch = True
+        mu_img_stat = feat_stats.get("mu_img")
+        inv_sigma_sq_img_stat = feat_stats.get("inv_sigma_sq_img")
+        mu_obj_dict_stat = feat_stats.get("mu_obj_dict") or {}
+        inv_sigma_sq_obj_dict_stat = feat_stats.get("inv_sigma_sq_obj_dict") or {}
+        self.register_buffer("mu_img", mu_img_stat)
+        self.register_buffer("inv_sigma_sq_img", inv_sigma_sq_img_stat)
+        if mu_img_stat is not None:
+            self.register_buffer("mu_te_img_ema", mu_img_stat.clone())
+        elif inv_sigma_sq_img_stat is not None:
+            self.register_buffer("mu_te_img_ema", torch.zeros_like(inv_sigma_sq_img_stat))
+        else:
+            self.register_buffer("mu_te_img_ema", torch.empty(0))
+        self.mu_obj_dict = nn.ParameterDict(
+            {str(k): nn.Parameter(v, requires_grad=False) for k, v in mu_obj_dict_stat.items()}
+        )
+        self.inv_sigma_sq_obj_dict = nn.ParameterDict(
+            {str(k): nn.Parameter(v, requires_grad=False) for k, v in inv_sigma_sq_obj_dict_stat.items()}
+        )
+        self.mu_te_obj_ema = nn.ParameterDict(
+            {k: nn.Parameter(v.clone(), requires_grad=False) for k, v in self.mu_obj_dict.items()}
+        )
+        self.register_buffer("D_in_KL", torch.tensor(D_in_KL))
+        self.register_buffer("L_ema", torch.tensor(D_in_KL))
+        self.register_buffer("_zero", torch.tensor(0.0))
+
+    def _calculate_kl_div(self, mu1, mu2, inv_sigma):
+        """Computes KL divergence: 0.5 * (mu2 - mu1)^T @ inv_sigma @ (mu2 - mu1)."""
+        if (
+            mu1 is None
+            or mu2 is None
+            or inv_sigma is None
+            or mu1.numel() == 0
+            or mu2.numel() == 0
+            or inv_sigma.numel() == 0
+        ):
+            dev = (
+                mu1.device
+                if mu1 is not None and mu1.numel() > 0
+                else (inv_sigma.device if inv_sigma is not None and inv_sigma.numel() > 0 else self._zero.device)
+            )
+            dt = (
+                mu1.dtype
+                if mu1 is not None and mu1.numel() > 0
+                else (inv_sigma.dtype if inv_sigma is not None and inv_sigma.numel() > 0 else self._zero.dtype)
+            )
+            return self._zero.to(device=dev, dtype=dt)
+
+        diff = mu2 - mu1
+        if inv_sigma.dim() == 1:
+            if diff.dim() > 1:
+                return 0.5 * torch.sum(inv_sigma * diff.pow(2), dim=-1)
+            else:
+                return 0.5 * torch.sum(inv_sigma * diff.pow(2))
+        elif inv_sigma.dim() == 2:
+            if diff.dim() > 1:
+                diff_unsqueezed = diff.unsqueeze(1)
+                return 0.5 * (diff_unsqueezed @ inv_sigma @ diff_unsqueezed.transpose(-1, -2)).squeeze()
+            else:
+                diff_unsqueezed = diff.unsqueeze(0)
+                return 0.5 * (diff_unsqueezed @ inv_sigma @ diff_unsqueezed.t()).squeeze()
+        else:
+            return self._zero.to(device=inv_sigma.device, dtype=inv_sigma.dtype)
+
+    def forward(self, F_te_img, F_te_obj_dict):
+        """Calculates the overall feature alignment loss."""
+        if self.mu_img is None or self.mu_img.numel() == 0:
+            device = self.D_in_KL.device
+            dtype = self.D_in_KL.dtype
+            return self._zero.to(device=device, dtype=dtype), self._zero.to(device=device, dtype=dtype), False
+        else:
+            device = self.mu_img.device
+            dtype = self.mu_img.dtype
+        L_img = self._zero.to(device=device, dtype=dtype).expand(())
+        L_obj = self._zero.to(device=device, dtype=dtype).expand(())
+        if F_te_img is not None and self.mu_img is not None and self.inv_sigma_sq_img is not None:
+            img_mean = F_te_img.mean(dim=0)
+            L_img = self._calculate_kl_div(self.mu_img, img_mean, self.inv_sigma_sq_img)
+            with torch.no_grad():
+                self.mu_te_img_ema.mul_(1 - self.alpha).add_(self.alpha * img_mean.to(self.mu_te_img_ema.dtype))
+        if F_te_obj_dict and self.mu_obj_dict and self.inv_sigma_sq_obj_dict:
+            valid_items = [
+                (k, v)
+                for k, v in F_te_obj_dict.items()
+                if v is not None and v.numel() > 0 and str(k) in self.mu_obj_dict
+            ]
+            if valid_items:
+                keys, feats_list = zip(*valid_items)
+                str_keys = [str(k) for k in keys]
+                counts = torch.tensor([f.shape[0] for f in feats_list], device=device, dtype=dtype)
+                total_count = counts.sum().clamp_min(1.0)
+                feat_means = torch.stack([f.mean(dim=0) for f in feats_list], dim=0)
+                mu_objs_batch = torch.stack([self.mu_obj_dict[k] for k in str_keys], dim=0)
+                invsig_objs_batch = torch.stack([self.inv_sigma_sq_obj_dict[k] for k in str_keys], dim=0)
+                kl_objs_batch = self._calculate_kl_div(mu_objs_batch, feat_means, invsig_objs_batch)
+                L_obj = (counts / total_count * kl_objs_batch).sum()
+                with torch.no_grad():
+                    for i, k in enumerate(str_keys):
+                        if k in self.mu_te_obj_ema:
+                            ema_param = self.mu_te_obj_ema[k]
+                            ema_param.mul_(1 - self.alpha).add_(self.alpha * feat_means[i].to(ema_param.dtype))
+        total_loss = L_img + L_obj
+        L_img_det = L_img.detach()
+        update = False
+        if F_te_img is not None or F_te_obj_dict:
+            if self.first_batch:
+                if L_img_det > 1e-9:
+                    self.L_ema.copy_(L_img_det)
+                    self.first_batch = False
+                    update = True
+            else:
+                self.L_ema.mul_(1 - self.alpha_ema_loss).add_(self.alpha_ema_loss * L_img_det)
+                idx1 = L_img_det / self.D_in_KL.clamp_min(1e-9)
+                idx2 = L_img_det / self.L_ema.clamp_min(1e-9)
+                update = (idx1 > self.tau1) | (idx2 > self.tau2)
+        if total_loss.numel() == 0:
+            total_loss = self._zero.to(device=device, dtype=dtype).expand(())
+        return total_loss, L_img_det, bool(update)
