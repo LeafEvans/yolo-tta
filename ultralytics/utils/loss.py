@@ -740,32 +740,14 @@ class E2EDetectLoss:
 
 class FeatureAlignmentLoss(nn.Module):
     """
-    FeatureAlignmentLoss implements a loss function that aligns incoming test features
-    with precomputed feature statistics via a KL divergence measure. It handles both image
-    and object features, updating their exponentially weighted moving averages (EMA) and
-    computing loss accordingly.
+    Feature alignment loss for test-time adaptation.
 
-    Parameters:
-        nc (int): Number of classes or feature channels.
-        feat_stats (dict): Dictionary containing precomputed feature statistics.
-        alpha (float, optional): EMA smoothing factor for test feature mean updates (default is 0.01).
-        alpha_ema_loss (float, optional): EMA smoothing factor for the loss update (default is 0.01).
-        D_in_KL (float, optional): Baseline constant used in KL divergence normalization (default is 0.5).
-        tau1 (float, optional): Threshold 1 for update decision (default is 1.1).
-        tau2 (float, optional): Threshold 2 for update decision (default is 1.05).
-
-    Attributes:
-        mu_img (Tensor): Reference mean image feature.
-        inv_sigma_sq_img (Tensor): Inverse variance for image features.
-        mu_obj_dict (ParameterDict): Object feature means.
-        inv_sigma_sq_obj_dict (ParameterDict): Object feature inverse variances.
-        mu_te_img_ema (Tensor): EMA of test image feature means.
-        mu_te_obj_ema (ParameterDict): EMA of test object feature means.
-        L_ema (Tensor): EMA of the image loss.
-        _zero (Tensor): Registered buffer for zero tensor.
+    Aligns test features with reference feature statistics using KL divergence.
+    Handles both image-level and object-level feature alignment with EMA updates.
     """
 
     def __init__(self, nc, feat_stats, alpha=0.01, alpha_ema_loss=0.01, D_in_KL=0.5, tau1=1.1, tau2=1.05):
+        """Initialize the FeatureAlignmentLoss class."""
         super().__init__()
         self.nc = nc
         self.alpha = alpha
@@ -794,99 +776,59 @@ class FeatureAlignmentLoss(nn.Module):
         self.mu_te_obj_ema = nn.ParameterDict(
             {k: nn.Parameter(v.clone(), requires_grad=False) for k, v in self.mu_obj_dict.items()}
         )
-        self.register_buffer("D_in_KL", torch.tensor(D_in_KL))
-        self.register_buffer("L_ema", torch.tensor(D_in_KL))
-        self.register_buffer("_zero", torch.tensor(0.0))
+        self.register_buffer("D_in_KL", torch.as_tensor(D_in_KL))
+        self.register_buffer("L_ema", torch.as_tensor(D_in_KL))
+        self.register_buffer("zero", torch.tensor(0.0))
 
     def _calculate_kl_div(self, mu1, mu2, inv_sigma):
-        """Computes KL divergence: 0.5 * (mu2 - mu1)^T @ inv_sigma @ (mu2 - mu1)."""
-        if (
-            mu1 is None
-            or mu2 is None
-            or inv_sigma is None
-            or mu1.numel() == 0
-            or mu2.numel() == 0
-            or inv_sigma.numel() == 0
-        ):
-            dev = (
-                mu1.device
-                if mu1 is not None and mu1.numel() > 0
-                else (inv_sigma.device if inv_sigma is not None and inv_sigma.numel() > 0 else self._zero.device)
-            )
-            dt = (
-                mu1.dtype
-                if mu1 is not None and mu1.numel() > 0
-                else (inv_sigma.dtype if inv_sigma is not None and inv_sigma.numel() > 0 else self._zero.dtype)
-            )
-            return self._zero.to(device=dev, dtype=dt)
-
+        """Calculate KL divergence between two distributions with shared variance."""
+        if mu1.numel() == 0 or mu2.numel() == 0 or inv_sigma.numel() == 0:
+            ref = mu1 if mu1.numel() > 0 else inv_sigma
+            return self.zero.to(ref.device).type_as(ref)
         diff = mu2 - mu1
-        if inv_sigma.dim() == 1:
-            if diff.dim() > 1:
-                return 0.5 * torch.sum(inv_sigma * diff.pow(2), dim=-1)
-            else:
-                return 0.5 * torch.sum(inv_sigma * diff.pow(2))
-        elif inv_sigma.dim() == 2:
-            if diff.dim() > 1:
-                diff_unsqueezed = diff.unsqueeze(1)
-                return 0.5 * (diff_unsqueezed @ inv_sigma @ diff_unsqueezed.transpose(-1, -2)).squeeze()
-            else:
-                diff_unsqueezed = diff.unsqueeze(0)
-                return 0.5 * (diff_unsqueezed @ inv_sigma @ diff_unsqueezed.t()).squeeze()
-        else:
-            return self._zero.to(device=inv_sigma.device, dtype=inv_sigma.dtype)
+        return 0.5 * torch.sum(inv_sigma * diff.pow(2), dim=-1)
 
     def forward(self, F_te_img, F_te_obj_dict):
-        """Calculates the overall feature alignment loss."""
-        if self.mu_img is None or self.mu_img.numel() == 0:
-            device = self.D_in_KL.device
-            dtype = self.D_in_KL.dtype
-            return self._zero.to(device=device, dtype=dtype), self._zero.to(device=device, dtype=dtype), False
-        else:
-            device = self.mu_img.device
-            dtype = self.mu_img.dtype
-        L_img = self._zero.to(device=device, dtype=dtype).expand(())
-        L_obj = self._zero.to(device=device, dtype=dtype).expand(())
-        if F_te_img is not None and self.mu_img is not None and self.inv_sigma_sq_img is not None:
-            img_mean = F_te_img.mean(dim=0)
+        device, dtype = self.mu_img.device, self.mu_img.dtype
+        if self.mu_img.numel() == 0 or self.inv_sigma_sq_img.numel() == 0:
+            zero = self.zero.to(device).type(dtype)
+            return zero, zero, False
+
+        L_img = self.zero.to(device).type(dtype)
+        L_obj = L_img
+
+        if F_te_img is not None:
+            img_mean = F_te_img.mean(0)
             L_img = self._calculate_kl_div(self.mu_img, img_mean, self.inv_sigma_sq_img)
             with torch.no_grad():
-                self.mu_te_img_ema.mul_(1 - self.alpha).add_(self.alpha * img_mean.to(self.mu_te_img_ema.dtype))
-        if F_te_obj_dict and self.mu_obj_dict and self.inv_sigma_sq_obj_dict:
-            valid_items = [
-                (k, v)
-                for k, v in F_te_obj_dict.items()
-                if v is not None and v.numel() > 0 and str(k) in self.mu_obj_dict
-            ]
-            if valid_items:
-                keys, feats_list = zip(*valid_items)
-                str_keys = [str(k) for k in keys]
-                counts = torch.tensor([f.shape[0] for f in feats_list], device=device, dtype=dtype)
-                total_count = counts.sum().clamp_min(1.0)
-                feat_means = torch.stack([f.mean(dim=0) for f in feats_list], dim=0)
-                mu_objs_batch = torch.stack([self.mu_obj_dict[k] for k in str_keys], dim=0)
-                invsig_objs_batch = torch.stack([self.inv_sigma_sq_obj_dict[k] for k in str_keys], dim=0)
-                kl_objs_batch = self._calculate_kl_div(mu_objs_batch, feat_means, invsig_objs_batch)
-                L_obj = (counts / total_count * kl_objs_batch).sum()
+                self.mu_te_img_ema.mul_(1 - self.alpha).add_(self.alpha * img_mean)
+
+        if self.mu_obj_dict and F_te_obj_dict:
+            valid = [(k, v) for k, v in F_te_obj_dict.items() if v.numel() > 0 and k in self.mu_obj_dict]
+            if valid:
+                keys, feats = zip(*valid)
+                counts = torch.tensor([f.shape[0] for f in feats], device=device, dtype=dtype)
+                total = counts.sum().clamp_min(1.0)
+                means = torch.stack([f.mean(0) for f in feats])
+                mus = torch.stack([self.mu_obj_dict[k] for k in keys])
+                invs = torch.stack([self.inv_sigma_sq_obj_dict[k] for k in keys])
+                kls = self._calculate_kl_div(mus, means, invs)
+                L_obj = (counts / total * kls).sum()
                 with torch.no_grad():
-                    for i, k in enumerate(str_keys):
-                        if k in self.mu_te_obj_ema:
-                            ema_param = self.mu_te_obj_ema[k]
-                            ema_param.mul_(1 - self.alpha).add_(self.alpha * feat_means[i].to(ema_param.dtype))
-        total_loss = L_img + L_obj
+                    for k, m in zip(keys, means):
+                        ema = self.mu_te_obj_ema[k]
+                        ema.mul_(1 - self.alpha).add_(self.alpha * m)
+
+        total = L_img + L_obj
         L_img_det = L_img.detach()
-        update = False
-        if F_te_img is not None or F_te_obj_dict:
-            if self.first_batch:
-                if L_img_det > 1e-9:
-                    self.L_ema.copy_(L_img_det)
-                    self.first_batch = False
-                    update = True
-            else:
-                self.L_ema.mul_(1 - self.alpha_ema_loss).add_(self.alpha_ema_loss * L_img_det)
-                idx1 = L_img_det / self.D_in_KL.clamp_min(1e-9)
-                idx2 = L_img_det / self.L_ema.clamp_min(1e-9)
-                update = (idx1 > self.tau1) | (idx2 > self.tau2)
-        if total_loss.numel() == 0:
-            total_loss = self._zero.to(device=device, dtype=dtype).expand(())
-        return total_loss, L_img_det, bool(update)
+        if self.first_batch and L_img_det > 1e-9:
+            self.L_ema.copy_(L_img_det)
+            self.first_batch = False
+            update = True
+        else:
+            self.L_ema.mul_(1 - self.alpha_ema_loss).add_(self.alpha_ema_loss * L_img_det)
+            idx1 = L_img_det / self.D_in_KL.clamp_min(1e-9)
+            idx2 = L_img_det / self.L_ema.clamp_min(1e-9)
+            update = (idx1 > self.tau1) | (idx2 > self.tau2)
+
+        return total, L_img_det, bool(update)
