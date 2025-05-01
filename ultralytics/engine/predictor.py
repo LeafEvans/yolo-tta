@@ -40,7 +40,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 from torch import optim
 
 from ultralytics.cfg import get_cfg, get_save_dir
@@ -342,15 +341,11 @@ class BasePredictor:
             for self.batch in self.dataset:
                 self.run_callbacks("on_predict_batch_start")
                 paths, im0s, s = self.batch
+
                 with profilers[0]:
                     im = self.preprocess(im0s)
 
                 if self.tta_enabled:
-                    if not self.done_tta_warmup:
-                        for m in self.model.model.modules():
-                            if isinstance(m, nn.BatchNorm2d):
-                                m.train()
-                        self.done_tta_warmup = True
                     with torch.set_grad_enabled(True):
                         raw = self.inference(im, *args, **kwargs)
                         with profilers[3]:
@@ -362,17 +357,10 @@ class BasePredictor:
                             with profilers[4]:
                                 loss_val.backward()
                                 self.tta_optimizer.step()
-                    for m in self.model.model.modules():
-                        if isinstance(m, nn.BatchNorm2d):
-                            m.eval()
 
                 with profilers[1]:
                     with torch.no_grad():
                         preds = self.inference(im, *args, **kwargs)
-
-                if self.args.embed:
-                    yield from [preds] if isinstance(preds, torch.Tensor) else preds  # yield embedding tensors
-                    continue
 
                 with profilers[2]:
                     self.results = self.postprocess(preds, im, im0s)
@@ -526,34 +514,26 @@ class BasePredictor:
                         tau1=self.args.tta_tau1,
                         tau2=self.args.tta_tau2,
                     ).to(self.device)
-
                     tta_params = []
-                    target_model = self.model.model
+                    target_model = module
                     for p in target_model.parameters():
-                        p.requires_grad_(False)
-                    if self.args.tta_bn_only:
-                        for m in target_model.modules():
-                            if isinstance(m, nn.BatchNorm2d):
-                                for p in m.parameters():
-                                    p.requires_grad_(True)
-                                    tta_params.append(p)
-                    else:
-                        for m in target_model.modules():
-                            if isinstance(m, Adaptor):
-                                for p in m.parameters():
-                                    p.requires_grad_(True)
-                                    tta_params.append(p)
+                        p.requires_grad_(False)  # Freeze all parameters first
+
+                    LOGGER.info("TTA mode: Updating Adaptor layers only.")
+                    for m in target_model.modules():
+                        if isinstance(m, Adaptor):
+                            for p in m.parameters():
+                                p.requires_grad_(True)  # Unfreeze Adaptor parameters
+                                tta_params.append(p)
 
                     if not tta_params:
-                        LOGGER.warning(
-                            "TTA enabled but no parameters selected for optimization (check tta_bn_only and model structure). Disabling TTA."
-                        )
+                        LOGGER.warning("TTA enabled but no Adaptor parameters found for optimization. Disabling TTA.")
                         self.tta_enabled = False
                     else:
                         self.tta_optimizer = optim.Adam(tta_params, lr=self.args.tta_lr)
                         self.tta_enabled = True
                         LOGGER.info(
-                            f"TTA enabled with {len(tta_params)} trainable parameters (lr={self.args.tta_lr}, bn_only={self.args.tta_bn_only})"
+                            f"TTA enabled with {len(tta_params)} trainable Adaptor parameters (lr={self.args.tta_lr})"
                         )
 
                 else:
