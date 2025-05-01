@@ -74,7 +74,6 @@ tta_optimizer: Adam # (str) optimizer for TTA, choices=[Adam, SGD]. Currently ha
 tta_criterion: FeatureAlignmentLoss # (str) loss function for TTA, choices=[EntropyLoss, FeatureAlignmentLoss]. Predictor uses FeatureAlignmentLoss.
 tta_feature_layer: 0 # (int) Index of the layer from which to extract features for TTA loss calculation (both online and offline)
 tta_conf_threshold: 0.5 # (float) Confidence threshold for using predicted boxes' features in TTA loss (online)
-tta_bn_only: True # (bool) TTA updates only BatchNorm layers (True) or Adaptor layers (False) (online)
 tta_alpha: 0.01 # (float) EMA decay factor for test feature statistics in FeatureAlignmentLoss (online)
 tta_alpha_ema_loss: 0.01 # (float) EMA decay factor for L_img loss component in FeatureAlignmentLoss (online)
 tta_tau1: 1.1 # (float) Threshold 1 for TTA update decision in FeatureAlignmentLoss (online)
@@ -141,5 +140,5 @@ crop_fraction: 1.0 # (float) image crop fraction for classification (0.1-1), 1.0
 # Custom config.yaml ---------------------------------------------------------------------------------------------------
 cfg: # (str, optional) for overriding defaults.yaml
 
-# Tracker settings ------------------------------------------------------------------------------------------------------
+# Tracker settings -----------------------------------------------------------------------------------------------------
 tracker: botsort.yaml # (str) tracker type, choices=[botsort.yaml, bytetrack.yaml]
