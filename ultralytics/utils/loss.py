@@ -808,22 +808,15 @@ class FeatureAlignmentLoss(nn.Module):
         L_img = self.zero.to(device).type(dtype)
         L_obj = self.zero.to(device).type(dtype)  # Initialize L_obj to zero
 
-        # Calculate L_img (Image-level Alignment)
-        # Always calculated unless mode is 'none' or stats are missing
-        if F_te_img is not None:
-            # Ensure F_te_img has features before calculating mean
-            if F_te_img.numel() > 0:
-                img_mean = F_te_img.mean(0)
-                L_img = self._calculate_kl_div(self.mu_img, img_mean, self.inv_sigma_sq_img)
-                # EMA update for image features (always done if L_img is calculated)
-                with torch.no_grad():
-                    self.mu_te_img_ema.mul_(1 - self.alpha).add_(self.alpha * img_mean)
-            else:
-                # Handle case where F_te_img is provided but empty
-                L_img = self.zero.to(device).type(dtype)
-        else:
-            # Handle case where F_te_img is None
-            L_img = self.zero.to(device).type(dtype)
+        # Calculate L_img (Image-level Alignment), use EMA-updated reference after first batch
+        if F_te_img is not None and F_te_img.numel() > 0:
+            img_mean = F_te_img.mean(0)
+            # choose reference: initial mu_img or EMA-updated mu_te_img_ema
+            ref_mu = self.mu_te_img_ema if not self.first_batch else self.mu_img
+            L_img = self._calculate_kl_div(ref_mu, img_mean, self.inv_sigma_sq_img)
+            # update EMA reference
+            with torch.no_grad():
+                self.mu_te_img_ema.mul_(1 - self.alpha).add_(self.alpha * img_mean)
 
         # Calculate L_obj (Object-level Alignment)
         # Calculated only if mode requires it and necessary data exists
@@ -851,15 +844,12 @@ class FeatureAlignmentLoss(nn.Module):
                         # Unweighted calculation (simple mean over present classes)
                         L_obj = kls.mean()
 
-                    # EMA update for object features (common for both obj modes)
+                    # EMA update for object features
                     with torch.no_grad():
                         for k, m in zip(keys, means):
-                            # Ensure the key exists in the EMA dictionary
-                            if k in self.mu_te_obj_ema:
-                                ema = self.mu_te_obj_ema[k]
+                            ema = self.mu_te_obj_ema.get(k)
+                            if ema is not None:
                                 ema.mul_(1 - self.alpha).add_(self.alpha * m)
-                            # else: # Optional: Initialize EMA if key wasn't present before
-                            #     self.mu_te_obj_ema[k] = nn.Parameter(m.clone(), requires_grad=False)
 
         # Calculate Total Loss based on mode
         if loss_mode == "limg_only":
@@ -892,7 +882,7 @@ class FeatureAlignmentLoss(nn.Module):
                 update = (idx1 > self.tau1) | (idx2 > self.tau2)
         # If L_img_det is very small or zero, keep update as False
 
-        # Ensure boolean return for update flag
-        update_flag = bool(update)
+        # return update flag as Python bool
+        update_flag = bool(update.item()) if isinstance(update, torch.Tensor) else bool(update)
 
         return total, L_img_det, update_flag

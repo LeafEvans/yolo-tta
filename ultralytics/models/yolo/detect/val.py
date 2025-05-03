@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+import torchvision
 
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.engine.validator import BaseValidator
@@ -460,3 +462,98 @@ class DetectionValidator(BaseValidator):
             except Exception as e:
                 LOGGER.warning(f"{pkg} unable to run: {e}")
         return stats
+
+    def _extract_features_for_tta(self, im, preds_raw):
+        # Separate preds_tensor and feats
+        if isinstance(preds_raw, (list, tuple)) and len(preds_raw) == 2:
+            preds_tensor, feats = preds_raw
+        else:
+            out = self.model.model(im)
+            if not (isinstance(out, (list, tuple)) and len(out) == 2):
+                return None, {} # Cannot proceed without features
+            preds_tensor, feats = out
+
+        # Select the feature map based on tta_feature_layer argument
+        idx = int(self.args.tta_feature_layer)
+        actual_idx = 0 if idx == -1 else idx if 0 <= idx < len(feats) else None
+        if actual_idx is None:
+            return None, {} # Invalid feature layer index
+
+        fmap = feats[actual_idx]  # [B, C, H, W]
+        B, C, H, W = fmap.shape
+        # Calculate image-level features (always calculated)
+        F_img = F.adaptive_avg_pool2d(fmap, (1, 1)).view(B, C)
+
+        # Perform NMS on raw predictions to get actual detections for TTA feature extraction
+        # Note: Using validator's NMS settings (conf, iou, etc.)
+        with torch.no_grad():
+            # Apply NMS per image in the batch
+            dets_batch = ops.non_max_suppression(
+                preds_tensor, self.args.conf, self.args.iou,
+                labels=self.lb, # Use labels if save_hybrid is enabled
+                nc=self.nc, multi_label=True,
+                agnostic=self.args.single_cls or self.args.agnostic_nms,
+                max_det=self.args.max_det, end2end=self.end2end,
+                rotated=self.args.task == "obb"
+            ) # List[Tensor[N, 6]]
+
+        # Prepare for RoI Align across the batch
+        device, dtype = fmap.device, fmap.dtype
+        _, _, H_in, W_in = im.shape
+        # Scale factor from input image size to feature map size
+        scale = torch.as_tensor([W / W_in, H / H_in, W / W_in, H / H_in], device=device, dtype=dtype)
+
+        all_rois = []
+        all_cls_idx = []
+
+        for b, dets in enumerate(dets_batch): # Iterate through images in the batch
+            if dets is None or dets.numel() == 0:
+                continue # Skip if no detections for this image
+
+            # Construct a simple 'boxes' object for this image
+            from types import SimpleNamespace
+            xy = dets[:, :4].unsqueeze(0)   # Shape [1, N, 4]
+            cls = dets[:, 5].long().unsqueeze(0) # Shape [1, N]
+            conf = dets[:, 4].unsqueeze(0)  # Shape [1, N]
+            boxes = SimpleNamespace(xyxy=xy, cls=cls, conf=conf)
+
+            xyxy = boxes.xyxy.to(device)
+            cls_t = boxes.cls.to(device)
+            confs = boxes.conf.to(device)
+
+            # Filter boxes by confidence threshold
+            mask = confs > self.args.tta_conf_threshold
+            m = mask[0] # Since we process one image (b) at a time, mask is [1, N]
+
+            if not m.any():
+                continue
+
+            coords = xyxy[0][m] * scale # Scale box coordinates
+            # Add batch index 'b' for RoI Align
+            bi = torch.full((coords.size(0), 1), b, device=device, dtype=coords.dtype)
+            current_rois = torch.cat([bi, coords], dim=1) # Shape [Num_RoIs_for_img_b, 5]
+            current_cls_idx = cls_t[0][m] # Shape [Num_RoIs_for_img_b]
+
+            all_rois.append(current_rois)
+            all_cls_idx.append(current_cls_idx)
+
+        # If no boxes passed the confidence threshold across the entire batch
+        if not all_rois:
+            return F_img, {}
+
+        rois = torch.cat(all_rois, dim=0)  # Shape [Total_RoIs, 5]
+        cls_idx = torch.cat(all_cls_idx, dim=0)  # Shape [Total_RoIs]
+
+        # Extract object-level features using RoI Align for all RoIs in the batch
+        obj_feats = torchvision.ops.roi_align(fmap, rois, output_size=(1, 1), spatial_scale=1.0, aligned=True).view(
+            -1, C # Shape [Total_RoIs, C]
+        )
+
+        # Group object features by class
+        F_obj = {}
+        for c in cls_idx.unique():
+            mask_c = cls_idx == c
+            if mask_c.any():
+                F_obj[int(c.item())] = obj_feats[mask_c]
+
+        return F_img, F_obj

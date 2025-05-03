@@ -36,7 +36,9 @@ from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.utils import LOGGER, TQDM, callbacks, colorstr, emojis
 from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.ops import Profile
-from ultralytics.utils.torch_utils import de_parallel, select_device, smart_inference_mode
+from ultralytics.utils.torch_utils import de_parallel, select_device
+from ultralytics.utils.loss import FeatureAlignmentLoss
+import torch.optim as optim
 
 
 class BaseValidator:
@@ -128,17 +130,32 @@ class BaseValidator:
         self.plots = {}
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
 
-    @smart_inference_mode()
+        # Test-Time Adaptation (TTA) settings
+        self.args.tta = getattr(self.args, "tta", False)
+        self.args.tta_feature_layer = getattr(self.args, "tta_feature_layer", -1)
+        self.args.tta_conf_threshold = getattr(self.args, "tta_conf_threshold", 0.5)
+        self.args.tta_lr = getattr(self.args, "tta_lr", 0.001)
+        self.args.tta_alpha = getattr(self.args, "tta_alpha", 0.01)
+        self.args.tta_alpha_ema_loss = getattr(self.args, "tta_alpha_ema_loss", 0.01)
+        self.args.tta_tau1 = getattr(self.args, "tta_tau1", 1.1)
+        self.args.tta_tau2 = getattr(self.args, "tta_tau2", 1.05)
+        self.args.tta_update_mode = getattr(self.args, "tta_update_mode", "adaptor").lower()
+        self.args.tta_loss_mode = getattr(self.args, "tta_loss_mode", "weighted_obj").lower()
+        self.args.tta_update_strategy = getattr(self.args, "tta_update_strategy", "conditional").lower()
+
+        # internal TTA state
+        self.tta_enabled = False
+        self.tta_features = None
+        self.tta_stats = None
+        self.tta_criterion = None
+        self.tta_optimizer = None
+        self._tta_orig_requires_grad = {}
+
     def __call__(self, trainer=None, model=None):
         """
-        Execute validation process, running inference on dataloader and computing performance metrics.
-
-        Args:
-            trainer (object, optional): Trainer object that contains the model to validate.
-            model (nn.Module, optional): Model to validate if not using a trainer.
-
-        Returns:
-            stats (dict): Dictionary containing validation statistics.
+        Run validation. If TTA is enabled, perform two-pass inference:
+          1) first pass with gradient to adapt parameters
+          2) second pass under no_grad for final prediction
         """
         self.training = trainer is not None
         augment = self.args.augment and (not self.training)
@@ -191,6 +208,9 @@ class BaseValidator:
 
             model.eval()
             model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz, imgsz))  # warmup
+            # configure TTA if requested
+            if self.args.tta:
+                self._setup_tta(model)
 
         self.run_callbacks("on_val_start")
         dt = (
@@ -210,8 +230,26 @@ class BaseValidator:
                 batch = self.preprocess(batch)
 
             # Inference
-            with dt[1]:
-                preds = model(batch["img"], augment=augment)
+            imgs = batch["img"]
+
+            if self.tta_enabled:
+                # forward with grad to compute and apply TTA loss
+                raw = model(imgs, augment=augment, embed=self.args.tta_feature_layer)
+                F_img, F_obj = self._extract_features_for_tta(imgs, raw)
+                if F_img is not None:
+                    loss_val, _, update_flag = self.tta_criterion(F_img, F_obj, loss_mode=self.args.tta_loss_mode)
+                    if loss_val is not None and loss_val > 0:
+                        self.tta_optimizer.zero_grad()
+                        loss_val.backward()
+                        if self.args.tta_update_strategy in ("always",) or update_flag:
+                            self.tta_optimizer.step()
+                # no_grad for final predictions
+                with torch.no_grad():
+                    preds = model(imgs, augment=augment)
+            else:
+                # Standard validation under no_grad
+                with torch.no_grad():
+                    preds = model(imgs, augment=augment)
 
             # Loss
             with dt[2]:
@@ -375,3 +413,95 @@ class BaseValidator:
     def eval_json(self, stats):
         """Evaluate and return JSON format of prediction statistics."""
         pass
+
+    def _extract_features_for_tta(self, im, preds_raw):
+        """
+        Placeholder for extracting features for TTA. Must be implemented by subclasses.
+
+        Args:
+            im (torch.Tensor): Preprocessed image tensor.
+            preds_raw (Any): Raw predictions from the model's inference step, potentially before NMS.
+
+        Returns:
+            tuple(torch.Tensor | None, dict | None):
+                - F_img: Image-level features.
+                - F_obj_dict: Object-level features dictionary {cls_idx: features}.
+        """
+        return None, None
+
+    def _setup_tta(self, backend: AutoBackend):
+        """
+        Hook into the feature layer, load statistics, build loss & optimizer for TTA.
+        """
+        # determine number of classes
+        nc = len(getattr(backend.model, "names", []))
+        # find module by index or name
+        named_mods = list(backend.model.named_modules())
+        idx = self.args.tta_feature_layer
+        if isinstance(idx, int):
+            name, module = named_mods[idx % len(named_mods)]
+        else:
+            module = dict(named_mods).get(idx, None)
+        if module is None:
+            return
+        LOGGER.info(f"TTA setup: feature_layer={self.args.tta_feature_layer}, update_mode={self.args.tta_update_mode}")
+        # hook to capture feature map
+        self.tta_hook = module.register_forward_hook(lambda m, inp, out: setattr(self, "tta_features", out))
+        # load saved TTA stats (tta_stats.pt) from model folder or save_dir
+        for p in (Path(self.args.model).parent, self.save_dir.parent / "train", self.save_dir):
+            stats_file = p / "tta_stats.pt"
+            if stats_file.exists():
+                LOGGER.info(f"Loading TTA stats from {stats_file}")
+                self.tta_stats = torch.load(stats_file, map_location=self.device)
+                break
+        if not hasattr(self, "tta_stats") or self.tta_stats is None:
+            LOGGER.warning("TTA stats not found, skipping TTA")
+            return
+        # build the TTA loss function
+        self.tta_criterion = FeatureAlignmentLoss(
+            nc=nc,
+            feat_stats={
+                "mu_img": self.tta_stats["mu_img"],
+                "inv_sigma_sq_img": self.tta_stats["inv_sigma_sq_img"],
+                "mu_obj_dict": self.tta_stats["mu_obj_dict"],
+                "inv_sigma_sq_obj_dict": self.tta_stats["inv_sigma_sq_obj_dict"],
+                "pi_obj": self.tta_stats.get("pi_obj", None),
+            },
+            alpha=self.args.tta_alpha,
+            alpha_ema_loss=self.args.tta_alpha_ema_loss,
+            D_in_KL=self.tta_stats.get("D_in_KL", 0.5),
+            tau1=self.args.tta_tau1,
+            tau2=self.args.tta_tau2,
+        ).to(self.device)
+        # freeze all parameters then unfreeze per update_mode
+        params = []
+        for name, p in backend.model.named_parameters():
+            p.requires_grad_(False)
+        # select TTA-updatable parameters
+        if self.args.tta_update_mode == "adaptor":
+            from ultralytics.nn.modules import Adaptor
+
+            for m in backend.model.modules():
+                if isinstance(m, Adaptor):
+                    for p in m.parameters():
+                        p.requires_grad_(True)
+                        params.append(p)
+        elif self.args.tta_update_mode == "full":
+            for _, p in backend.model.named_parameters():
+                p.requires_grad_(True)
+                params.append(p)
+        if not params:
+            LOGGER.warning("No TTA parameters found, disabling TTA")
+            return
+        LOGGER.info(f"TTA will update {len(params)} parameters (mode={self.args.tta_update_mode})")
+        # create optimizer for TTA
+        self.tta_optimizer = optim.Adam(params, lr=self.args.tta_lr)
+        self.tta_enabled = True
+
+    def _cleanup_tta(self):
+        """Remove hooks and restore original requires_grad flags."""
+        if hasattr(self, "tta_hook"):
+            self.tta_hook.remove()
+        for n, p in self.model.model.named_parameters():
+            if n in self._tta_orig_requires_grad:
+                p.requires_grad_(self._tta_orig_requires_grad[n])

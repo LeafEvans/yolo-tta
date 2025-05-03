@@ -18,40 +18,58 @@ class DetectionPredictor(BasePredictor):
         super().__init__(cfg, overrides, _callbacks)
 
     def _extract_features_for_tta(self, im, preds_raw):
+        # Split preds_tensor and feats
         if isinstance(preds_raw, (list, tuple)) and len(preds_raw) == 2:
-            _, feats = preds_raw
+            preds_tensor, feats = preds_raw
         else:
             out = self.model.model(im)
             if not (isinstance(out, (list, tuple)) and len(out) == 2):
                 return None, {}
-            _, feats = out
+            preds_tensor, feats = out
+
+        # Apply NMS to original preds_tensor
+        with torch.no_grad():
+            dets = ops.non_max_suppression(
+                preds_tensor,
+                self.args.conf,
+                self.args.iou,
+                classes=self.args.classes,
+                agnostic=self.args.agnostic_nms,
+                max_det=self.args.max_det,
+                nc=len(self.model.names),
+                rotated=self.args.task == "obb",
+            )[0]
+        if dets is None or dets.numel() == 0:
+            F_img = F.adaptive_avg_pool2d(feats[0], (1, 1)).view(1, -1)
+            return F_img, {}
+
+        # Construct boxes object
+        from types import SimpleNamespace
+
+        B = feats[0].shape[0] if isinstance(feats, (list, tuple)) else 1
+        xy = dets[:, :4].view(1, -1, 4)
+        cls = dets[:, 5].long().view(1, -1)
+        conf = dets[:, 4].view(1, -1)
+        boxes = SimpleNamespace(xyxy=xy, cls=cls, conf=conf)
 
         idx = int(self.args.tta_feature_layer)
         actual_idx = 0 if idx == -1 else idx if 0 <= idx < len(feats) else None
         if actual_idx is None:
             return None, {}
 
-        fmap = feats[actual_idx]  # [B, C, H, W]
+        fmap = feats[actual_idx]
         B, C, H, W = fmap.shape
         F_img = F.adaptive_avg_pool2d(fmap, (1, 1)).view(B, C)
-
-        boxes = getattr(preds_raw, "boxes", None)
-        if boxes is None or boxes.xyxy.numel() == 0:
-            return F_img, {}
 
         device, dtype = fmap.device, fmap.dtype
         _, _, H_in, W_in = im.shape
         scale = torch.as_tensor([W / W_in, H / H_in, W / W_in, H / H_in], device=device, dtype=dtype)
-        xyxy = boxes.xyxy
-        if xyxy.device != device:
-            xyxy = xyxy.to(device)
-        cls_t = boxes.cls.long()
-        if cls_t.device != device:
-            cls_t = cls_t.to(device)
+        xyxy = boxes.xyxy.to(device) if boxes.xyxy.device != device else boxes.xyxy
+        cls_t = boxes.cls.long().to(device) if boxes.cls.device != device else boxes.cls.long()
+
         confs = getattr(boxes, "conf", None)
         if confs is not None:
-            if confs.device != device:
-                confs = confs.to(device)
+            confs = confs.to(device) if confs.device != device else confs
             mask = confs > self.args.tta_conf_threshold
         else:
             mask = torch.ones_like(cls_t, dtype=torch.bool, device=device)
@@ -69,8 +87,8 @@ class DetectionPredictor(BasePredictor):
         if not rois:
             return F_img, {}
 
-        rois = torch.cat(rois, dim=0)  # [N, 5]
-        cls_idx = torch.cat(cls_idx, dim=0)  # [N]
+        rois = torch.cat(rois, dim=0)
+        cls_idx = torch.cat(cls_idx, dim=0)
 
         obj_feats = torchvision.ops.roi_align(fmap, rois, output_size=(1, 1), spatial_scale=1.0, aligned=True).view(
             -1, C
