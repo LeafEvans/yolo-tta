@@ -784,51 +784,115 @@ class FeatureAlignmentLoss(nn.Module):
         """Calculate KL divergence between two distributions with shared variance."""
         if mu1.numel() == 0 or mu2.numel() == 0 or inv_sigma.numel() == 0:
             ref = mu1 if mu1.numel() > 0 else inv_sigma
+            # Ensure the returned zero tensor has the correct dtype and device
             return self.zero.to(ref.device).type_as(ref)
         diff = mu2 - mu1
+        # Ensure sum is over the feature dimension (assumed to be the last dimension)
         return 0.5 * torch.sum(inv_sigma * diff.pow(2), dim=-1)
 
-    def forward(self, F_te_img, F_te_obj_dict):
+    def forward(self, F_te_img, F_te_obj_dict, loss_mode="weighted_obj"):
         device, dtype = self.mu_img.device, self.mu_img.dtype
+
+        # Handle 'none' mode early: Return zero loss and no update flag
+        if loss_mode == "none":
+            zero = self.zero.to(device).type(dtype)
+            # Return total_loss=0, L_img_det=0, update_flag=False
+            return zero, zero, False
+
+        # Check if reference statistics are loaded
         if self.mu_img.numel() == 0 or self.inv_sigma_sq_img.numel() == 0:
             zero = self.zero.to(device).type(dtype)
+            # Return zero loss if stats are missing, and no update flag
             return zero, zero, False
 
         L_img = self.zero.to(device).type(dtype)
-        L_obj = L_img
+        L_obj = self.zero.to(device).type(dtype)  # Initialize L_obj to zero
 
+        # Calculate L_img (Image-level Alignment)
+        # Always calculated unless mode is 'none' or stats are missing
         if F_te_img is not None:
-            img_mean = F_te_img.mean(0)
-            L_img = self._calculate_kl_div(self.mu_img, img_mean, self.inv_sigma_sq_img)
-            with torch.no_grad():
-                self.mu_te_img_ema.mul_(1 - self.alpha).add_(self.alpha * img_mean)
-
-        if self.mu_obj_dict and F_te_obj_dict:
-            valid = [(k, v) for k, v in F_te_obj_dict.items() if v.numel() > 0 and k in self.mu_obj_dict]
-            if valid:
-                keys, feats = zip(*valid)
-                counts = torch.tensor([f.shape[0] for f in feats], device=device, dtype=dtype)
-                total = counts.sum().clamp_min(1.0)
-                means = torch.stack([f.mean(0) for f in feats])
-                mus = torch.stack([self.mu_obj_dict[k] for k in keys])
-                invs = torch.stack([self.inv_sigma_sq_obj_dict[k] for k in keys])
-                kls = self._calculate_kl_div(mus, means, invs)
-                L_obj = (counts / total * kls).sum()
+            # Ensure F_te_img has features before calculating mean
+            if F_te_img.numel() > 0:
+                img_mean = F_te_img.mean(0)
+                L_img = self._calculate_kl_div(self.mu_img, img_mean, self.inv_sigma_sq_img)
+                # EMA update for image features (always done if L_img is calculated)
                 with torch.no_grad():
-                    for k, m in zip(keys, means):
-                        ema = self.mu_te_obj_ema[k]
-                        ema.mul_(1 - self.alpha).add_(self.alpha * m)
-
-        total = L_img + L_obj
-        L_img_det = L_img.detach()
-        if self.first_batch and L_img_det > 1e-9:
-            self.L_ema.copy_(L_img_det)
-            self.first_batch = False
-            update = True
+                    self.mu_te_img_ema.mul_(1 - self.alpha).add_(self.alpha * img_mean)
+            else:
+                # Handle case where F_te_img is provided but empty
+                L_img = self.zero.to(device).type(dtype)
         else:
-            self.L_ema.mul_(1 - self.alpha_ema_loss).add_(self.alpha_ema_loss * L_img_det)
-            idx1 = L_img_det / self.D_in_KL.clamp_min(1e-9)
-            idx2 = L_img_det / self.L_ema.clamp_min(1e-9)
-            update = (idx1 > self.tau1) | (idx2 > self.tau2)
+            # Handle case where F_te_img is None
+            L_img = self.zero.to(device).type(dtype)
 
-        return total, L_img_det, bool(update)
+        # Calculate L_obj (Object-level Alignment)
+        # Calculated only if mode requires it and necessary data exists
+        if loss_mode in ["unweighted_obj", "weighted_obj"]:
+            if self.mu_obj_dict and F_te_obj_dict:
+                # Filter for valid object features present in the current batch AND in the reference stats
+                valid = [(str(k), v) for k, v in F_te_obj_dict.items() if v.numel() > 0 and str(k) in self.mu_obj_dict]
+
+                if valid:
+                    keys, feats = zip(*valid)  # keys are strings here
+                    means = torch.stack([f.mean(0) for f in feats])
+                    mus = torch.stack([self.mu_obj_dict[k] for k in keys])
+                    invs = torch.stack([self.inv_sigma_sq_obj_dict[k] for k in keys])
+
+                    # Calculate KL divergence for each valid object class found
+                    kls = self._calculate_kl_div(mus, means, invs)  # Shape: (num_valid_classes,)
+
+                    if loss_mode == "weighted_obj":
+                        # Original weighted calculation (based on batch counts)
+                        counts = torch.tensor([f.shape[0] for f in feats], device=device, dtype=dtype)
+                        total_counts = counts.sum().clamp_min(1.0)
+                        # Ensure kls and counts have compatible shapes for broadcasting if needed
+                        L_obj = (counts / total_counts * kls).sum()
+                    elif loss_mode == "unweighted_obj":
+                        # Unweighted calculation (simple mean over present classes)
+                        L_obj = kls.mean()
+
+                    # EMA update for object features (common for both obj modes)
+                    with torch.no_grad():
+                        for k, m in zip(keys, means):
+                            # Ensure the key exists in the EMA dictionary
+                            if k in self.mu_te_obj_ema:
+                                ema = self.mu_te_obj_ema[k]
+                                ema.mul_(1 - self.alpha).add_(self.alpha * m)
+                            # else: # Optional: Initialize EMA if key wasn't present before
+                            #     self.mu_te_obj_ema[k] = nn.Parameter(m.clone(), requires_grad=False)
+
+        # Calculate Total Loss based on mode
+        if loss_mode == "limg_only":
+            total = L_img
+        elif loss_mode in ["unweighted_obj", "weighted_obj"]:
+            total = L_img + L_obj
+        else:
+            # Should not happen if mode is validated earlier, but as a fallback
+            total = self.zero.to(device).type(dtype)
+
+        # Update Decision Logic (Based on L_img)
+        L_img_det = L_img.detach()
+        update = False  # Default to no update
+
+        # Check if D_in_KL is valid before using it
+        D_in_KL_clamped = self.D_in_KL.clamp_min(1e-9)
+        L_ema_clamped = self.L_ema.clamp_min(1e-9)
+
+        # Only calculate update flag if L_img is meaningful
+        if L_img_det > 1e-9:  # Use a small threshold to avoid division by zero or unstable ratios
+            if self.first_batch:
+                self.L_ema.copy_(L_img_det)
+                self.first_batch = False
+                update = True
+            else:
+                self.L_ema.mul_(1 - self.alpha_ema_loss).add_(self.alpha_ema_loss * L_img_det)
+                # Calculate update conditions only if denominators are safe
+                idx1 = L_img_det / D_in_KL_clamped
+                idx2 = L_img_det / L_ema_clamped
+                update = (idx1 > self.tau1) | (idx2 > self.tau2)
+        # If L_img_det is very small or zero, keep update as False
+
+        # Ensure boolean return for update flag
+        update_flag = bool(update)
+
+        return total, L_img_det, update_flag
