@@ -78,6 +78,9 @@ tta_alpha: 0.01 # (float) EMA decay factor for test feature statistics in Featur
 tta_alpha_ema_loss: 0.01 # (float) EMA decay factor for L_img loss component in FeatureAlignmentLoss (online)
 tta_tau1: 1.1 # (float) Threshold 1 for TTA update decision in FeatureAlignmentLoss (online)
 tta_tau2: 1.05 # (float) Threshold 2 for TTA update decision in FeatureAlignmentLoss (online)
+tta_update_mode: adaptor # (str) TTA parameter update mode: 'adaptor', 'full'
+tta_loss_mode: weighted_obj # (str) TTA loss calculation mode: 'none', 'limg_only', 'unweighted_obj', 'weighted_obj'
+tta_update_strategy: conditional # (str) TTA update strategy: 'always', 'conditional'
 calculate_tta_stats: False # (bool) Calculate and save TTA statistics (mean, variance) after training finishes
 tta_stat_samples: 2000 # (int) Number of training samples to use for calculating TTA stats (offline)
 tta_epsilon: 1e-9 # (float) Small value added to variance before inversion for numerical stability (offline)
