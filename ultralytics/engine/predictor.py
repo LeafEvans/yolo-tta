@@ -131,12 +131,14 @@ class BasePredictor:
         self.args.tta_conf_threshold = getattr(
             self.args, "tta_conf_threshold", 0.5
         )  # Confidence threshold for using predicted boxes in TTA
-        self.args.tta_bn_only = getattr(self.args, "tta_bn_only", True)
         self.args.tta_lr = getattr(self.args, "tta_lr", 0.001)
         self.args.tta_alpha = getattr(self.args, "tta_alpha", 0.01)  # EMA decay for test features
         self.args.tta_alpha_ema_loss = getattr(self.args, "tta_alpha_ema_loss", 0.01)  # EMA decay for L_img loss
         self.args.tta_tau1 = getattr(self.args, "tta_tau1", 1.1)  # Threshold 1 for update
         self.args.tta_tau2 = getattr(self.args, "tta_tau2", 1.05)  # Threshold 2 for update
+        self.args.tta_update_mode = getattr(self.args, "tta_update_mode", "adaptor").lower()
+        self.args.tta_loss_mode = getattr(self.args, "tta_loss_mode", "weighted_obj").lower()
+        self.args.tta_update_strategy = getattr(self.args, "tta_update_strategy", "conditional").lower()
 
         # Usable if setup is done
         self.model = None
@@ -347,17 +349,39 @@ class BasePredictor:
 
                 if self.tta_enabled:
                     with torch.set_grad_enabled(True):
+                        # First inference to get features and raw predictions
                         raw = self.inference(im, *args, **kwargs)
                         with profilers[3]:
                             F_img, F_obj = self._extract_features_for_tta(im, raw)
-                        if F_img is not None:
-                            loss_out = self.tta_criterion(F_img, F_obj)
-                            loss_val = loss_out[0] if isinstance(loss_out, (tuple, list)) else loss_out
-                            self.tta_optimizer.zero_grad()
-                            with profilers[4]:
-                                loss_val.backward()
-                                self.tta_optimizer.step()
 
+                        if F_img is not None:
+                            # Calculate TTA loss and get update flag, passing loss_mode
+                            loss_out = self.tta_criterion(F_img, F_obj, loss_mode=self.args.tta_loss_mode)
+                            loss_val, _, update_flag = loss_out  # Unpack the loss and the flag
+
+                            if loss_val > 0:  # Only proceed if loss is valid
+                                self.tta_optimizer.zero_grad()
+                                with profilers[4]:  # Profile backward pass
+                                    loss_val.backward()
+
+                                # Decide whether to step the optimizer based on strategy and flag
+                                perform_step = False
+                                if self.args.tta_update_strategy == "always":
+                                    perform_step = True
+                                elif self.args.tta_update_strategy == "conditional":
+                                    perform_step = update_flag  # Use the flag from the loss function
+                                else:
+                                    LOGGER.warning(
+                                        f"Unknown tta_update_strategy: {self.args.tta_update_strategy}. Defaulting to no update."
+                                    )
+
+                                if perform_step:
+                                    # Profile optimizer step separately if needed, or include in backward profile
+                                    self.tta_optimizer.step()
+                        # else: # Optional: Handle case where no features were extracted
+                        #     pass
+
+                # Second inference (no_grad) for final predictions after potential update
                 with profilers[1]:
                     with torch.no_grad():
                         preds = self.inference(im, *args, **kwargs)
@@ -375,8 +399,10 @@ class BasePredictor:
                         "postprocess": profilers[2].dt * 1e3 / n,
                     }
                     if self.tta_enabled:
+                        # Note: profilers[4] now includes backward pass time.
+                        # If you want separate step time, add another profiler.
                         speed_metrics["tta_features"] = profilers[3].dt * 1e3 / n
-                        speed_metrics["tta_update"] = profilers[4].dt * 1e3 / n
+                        speed_metrics["tta_update"] = profilers[4].dt * 1e3 / n  # Includes backward + potential step
 
                     self.results[i].speed = speed_metrics
                     if self.args.verbose or self.args.save or self.args.save_txt or self.args.show:
@@ -399,7 +425,7 @@ class BasePredictor:
             speed_str = f"Speed: {t_pre:.1f}ms preprocess, {t_inf:.1f}ms inference, {t_post:.1f}ms postprocess"
             if self.tta_enabled:
                 t_tta_feat = profilers[3].t / self.seen * 1e3
-                t_tta_upd = profilers[4].t / self.seen * 1e3
+                t_tta_upd = profilers[4].t / self.seen * 1e3  # Includes backward + potential step
                 speed_str += f", {t_tta_feat:.1f}ms TTA feats, {t_tta_upd:.1f}ms TTA update"
             speed_str += f" per image at shape {(min(self.args.batch, self.seen), 3, *im.shape[2:])}"
             LOGGER.info(speed_str)
@@ -519,21 +545,41 @@ class BasePredictor:
                     for p in target_model.parameters():
                         p.requires_grad_(False)  # Freeze all parameters first
 
-                    LOGGER.info("TTA mode: Updating Adaptor layers only.")
-                    for m in target_model.modules():
-                        if isinstance(m, Adaptor):
-                            for p in m.parameters():
-                                p.requires_grad_(True)  # Unfreeze Adaptor parameters
-                                tta_params.append(p)
+                    LOGGER.info(f"Setting up TTA with update mode: '{self.args.tta_update_mode}'")
+
+                    if self.args.tta_update_mode == "adaptor":
+                        LOGGER.info("TTA mode: Finding Adaptor layers to update.")
+                        for m in target_model.modules():
+                            if isinstance(m, Adaptor):
+                                for p in m.parameters():
+                                    p.requires_grad_(True)
+                                    tta_params.append(p)
+                        if not tta_params:
+                            LOGGER.warning("TTA update mode is 'adaptor', but no Adaptor layers found.")
+
+                    elif self.args.tta_update_mode == "full":
+                        LOGGER.info("TTA mode: Setting all model parameters to be updated.")
+                        for p in target_model.parameters():
+                            p.requires_grad_(True)
+                            tta_params.append(p)  # Collect all parameters
+
+                    else:
+                        LOGGER.warning(
+                            f"Unknown tta_update_mode: '{self.args.tta_update_mode}'. Supported modes are 'adaptor' and 'full'. Defaulting to no TTA updates."
+                        )
+                        # Ensure tta_params is empty if mode is unknown
+                        tta_params = []
 
                     if not tta_params:
-                        LOGGER.warning("TTA enabled but no Adaptor parameters found for optimization. Disabling TTA.")
+                        LOGGER.warning(
+                            f"TTA enabled but no parameters selected for update mode '{self.args.tta_update_mode}'. Disabling TTA."
+                        )
                         self.tta_enabled = False
                     else:
                         self.tta_optimizer = optim.Adam(tta_params, lr=self.args.tta_lr)
                         self.tta_enabled = True
                         LOGGER.info(
-                            f"TTA enabled with {len(tta_params)} trainable Adaptor parameters (lr={self.args.tta_lr})"
+                            f"TTA enabled with {len(tta_params)} trainable parameters (mode='{self.args.tta_update_mode}', lr={self.args.tta_lr})"
                         )
 
                 else:
