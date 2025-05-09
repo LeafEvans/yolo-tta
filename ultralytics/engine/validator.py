@@ -181,7 +181,6 @@ class BaseValidator:
                 data=self.args.data,
                 fp16=self.args.half,
             )
-            # self.model = model
             self.device = model.device  # update device
             self.args.half = model.fp16  # update half
             stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
@@ -233,7 +232,6 @@ class BaseValidator:
             imgs = batch["img"]
 
             if self.tta_enabled:
-                # forward with grad to compute and apply TTA loss
                 raw = model(imgs, augment=augment, embed=self.args.tta_feature_layer)
                 F_img, F_obj = self._extract_features_for_tta(imgs, raw)
                 if F_img is not None:
@@ -243,11 +241,8 @@ class BaseValidator:
                         loss_val.backward()
                         if self.args.tta_update_strategy in ("always",) or update_flag:
                             self.tta_optimizer.step()
-                # no_grad for final predictions
-                with torch.no_grad():
-                    preds = model(imgs, augment=augment)
+                preds = raw.detach()
             else:
-                # Standard validation under no_grad
                 with torch.no_grad():
                     preds = model(imgs, augment=augment)
 
@@ -362,7 +357,7 @@ class BaseValidator:
 
     def init_metrics(self, model):
         """Initialize performance metrics for the YOLO model."""
-        pass
+        self.model = model
 
     def update_metrics(self, preds, batch):
         """Update metrics based on predictions and batch."""
@@ -415,27 +410,27 @@ class BaseValidator:
         pass
 
     def _extract_features_for_tta(self, im, preds_raw):
-        """
-        Placeholder for extracting features for TTA. Must be implemented by subclasses.
+        from ultralytics.utils.tta import extract_tta_features
 
-        Args:
-            im (torch.Tensor): Preprocessed image tensor.
-            preds_raw (Any): Raw predictions from the model's inference step, potentially before NMS.
-
-        Returns:
-            tuple(torch.Tensor | None, dict | None):
-                - F_img: Image-level features.
-                - F_obj_dict: Object-level features dictionary {cls_idx: features}.
-        """
-        return None, None
+        return extract_tta_features(
+            im,
+            preds_raw,
+            self.args.conf,
+            self.args.iou,
+            self.args.classes,
+            self.args.agnostic_nms,
+            self.args.max_det,
+            self.nc,
+            self.args.task == "obb",
+            self.args.tta_feature_layer,
+            self.args.tta_conf_threshold,
+        )
 
     def _setup_tta(self, backend: AutoBackend):
         """
         Hook into the feature layer, load statistics, build loss & optimizer for TTA.
         """
-        # determine number of classes
         nc = len(getattr(backend.model, "names", []))
-        # find module by index or name
         named_mods = list(backend.model.named_modules())
         idx = self.args.tta_feature_layer
         if isinstance(idx, int):
@@ -445,19 +440,15 @@ class BaseValidator:
         if module is None:
             return
         LOGGER.info(f"TTA setup: feature_layer={self.args.tta_feature_layer}, update_mode={self.args.tta_update_mode}")
-        # hook to capture feature map
-        self.tta_hook = module.register_forward_hook(lambda m, inp, out: setattr(self, "tta_features", out))
-        # load saved TTA stats (tta_stats.pt) from model folder or save_dir
         for p in (Path(self.args.model).parent, self.save_dir.parent / "train", self.save_dir):
             stats_file = p / "tta_stats.pt"
             if stats_file.exists():
-                LOGGER.info(f"Loading TTA stats from {stats_file}")
                 self.tta_stats = torch.load(stats_file, map_location=self.device)
+                LOGGER.info(f"Loaded TTA stats from {stats_file}")
                 break
-        if not hasattr(self, "tta_stats") or self.tta_stats is None:
-            LOGGER.warning("TTA stats not found, skipping TTA")
+        if not getattr(self, "tta_stats", None):
+            LOGGER.warning("TTA stats not found, disabling TTA")
             return
-        # build the TTA loss function
         self.tta_criterion = FeatureAlignmentLoss(
             nc=nc,
             feat_stats={
@@ -473,11 +464,9 @@ class BaseValidator:
             tau1=self.args.tta_tau1,
             tau2=self.args.tta_tau2,
         ).to(self.device)
-        # freeze all parameters then unfreeze per update_mode
         params = []
         for name, p in backend.model.named_parameters():
             p.requires_grad_(False)
-        # select TTA-updatable parameters
         if self.args.tta_update_mode == "adaptor":
             from ultralytics.nn.modules import Adaptor
 
@@ -494,7 +483,6 @@ class BaseValidator:
             LOGGER.warning("No TTA parameters found, disabling TTA")
             return
         LOGGER.info(f"TTA will update {len(params)} parameters (mode={self.args.tta_update_mode})")
-        # create optimizer for TTA
         self.tta_optimizer = optim.Adam(params, lr=self.args.tta_lr)
         self.tta_enabled = True
 
