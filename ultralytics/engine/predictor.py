@@ -128,14 +128,12 @@ class BasePredictor:
         # TTA specific args
         self.args.tta = getattr(self.args, "tta", False)
         self.args.tta_feature_layer = getattr(self.args, "tta_feature_layer", -1)
-        self.args.tta_conf_threshold = getattr(
-            self.args, "tta_conf_threshold", 0.5
-        )  # Confidence threshold for using predicted boxes in TTA
+        self.args.tta_conf_threshold = getattr(self.args, "tta_conf_threshold", 0.5)
         self.args.tta_lr = getattr(self.args, "tta_lr", 0.001)
-        self.args.tta_alpha = getattr(self.args, "tta_alpha", 0.01)  # EMA decay for test features
-        self.args.tta_alpha_ema_loss = getattr(self.args, "tta_alpha_ema_loss", 0.01)  # EMA decay for L_img loss
-        self.args.tta_tau1 = getattr(self.args, "tta_tau1", 1.1)  # Threshold 1 for update
-        self.args.tta_tau2 = getattr(self.args, "tta_tau2", 1.05)  # Threshold 2 for update
+        self.args.tta_alpha = getattr(self.args, "tta_alpha", 0.01)
+        self.args.tta_alpha_ema_loss = getattr(self.args, "tta_alpha_ema_loss", 0.01)
+        self.args.tta_tau1 = getattr(self.args, "tta_tau1", 1.1)
+        self.args.tta_tau2 = getattr(self.args, "tta_tau2", 1.05)
         self.args.tta_update_mode = getattr(self.args, "tta_update_mode", "adaptor").lower()
         self.args.tta_loss_mode = getattr(self.args, "tta_loss_mode", "weighted_obj").lower()
         self.args.tta_update_strategy = getattr(self.args, "tta_update_strategy", "conditional").lower()
@@ -194,7 +192,8 @@ class BasePredictor:
             if self.args.visualize and (not self.source_type.tensor)
             else False
         )
-        return self.model(im, augment=self.args.augment, visualize=visualize, embed=self.args.embed, *args, **kwargs)
+        embed_arg = None if self.tta_enabled else self.args.embed
+        return self.model(im, augment=self.args.augment, visualize=visualize, embed=embed_arg, *args, **kwargs)
 
     def pre_transform(self, im):
         """
@@ -314,7 +313,7 @@ class BasePredictor:
 
         # Setup model
         if not self.model:
-            self.setup_model(model)  # This now includes TTA setup
+            self.setup_model(model)
 
         with self._lock:  # for thread-safe inference
             # Setup source every time predict is called
@@ -347,47 +346,30 @@ class BasePredictor:
                 with profilers[0]:
                     im = self.preprocess(im0s)
 
-                if self.tta_enabled:
-                    with torch.set_grad_enabled(True):
-                        # First inference to get features and raw predictions
+                with torch.set_grad_enabled(self.tta_enabled):
+                    with profilers[1]:
                         raw = self.inference(im, *args, **kwargs)
-                        with profilers[3]:
-                            F_img, F_obj = self._extract_features_for_tta(im, raw)
 
-                        if F_img is not None:
-                            # Calculate TTA loss and get update flag, passing loss_mode
-                            loss_out = self.tta_criterion(F_img, F_obj, loss_mode=self.args.tta_loss_mode)
-                            loss_val, _, update_flag = loss_out  # Unpack the loss and the flag
-
-                            if loss_val > 0:  # Only proceed if loss is valid
-                                self.tta_optimizer.zero_grad()
-                                with profilers[4]:  # Profile backward pass
-                                    loss_val.backward()
-
-                                # Decide whether to step the optimizer based on strategy and flag
-                                perform_step = False
-                                if self.args.tta_update_strategy == "always":
-                                    perform_step = True
-                                elif self.args.tta_update_strategy == "conditional":
-                                    perform_step = update_flag  # Use the flag from the loss function
-                                else:
-                                    LOGGER.warning(
-                                        f"Unknown tta_update_strategy: {self.args.tta_update_strategy}. Defaulting to no update."
-                                    )
-
+                if self.tta_enabled:
+                    with profilers[3]:
+                        F_img, F_obj = self._extract_features_for_tta(im, raw)
+                    if F_img is not None:
+                        loss_val, _, update_flag = self.tta_criterion(F_img, F_obj, loss_mode=self.args.tta_loss_mode)
+                        if loss_val > 0:
+                            self.tta_optimizer.zero_grad()
+                            with profilers[4]:
+                                loss_val.backward()
+                                perform_step = self.args.tta_update_strategy == "always" or (
+                                    self.args.tta_update_strategy == "conditional" and update_flag
+                                )
                                 if perform_step:
-                                    # Profile optimizer step separately if needed, or include in backward profile
                                     self.tta_optimizer.step()
-                        # else: # Optional: Handle case where no features were extracted
-                        #     pass
-
-                # Second inference (no_grad) for final predictions after potential update
-                with profilers[1]:
-                    with torch.no_grad():
-                        preds = self.inference(im, *args, **kwargs)
 
                 with profilers[2]:
-                    self.results = self.postprocess(preds, im, im0s)
+                    with torch.no_grad():
+                        preds = raw
+                        self.results = self.postprocess(preds, im, im0s)
+
                 self.run_callbacks("on_predict_postprocess_end")
 
                 n = len(im0s)
@@ -399,10 +381,8 @@ class BasePredictor:
                         "postprocess": profilers[2].dt * 1e3 / n,
                     }
                     if self.tta_enabled:
-                        # Note: profilers[4] now includes backward pass time.
-                        # If you want separate step time, add another profiler.
                         speed_metrics["tta_features"] = profilers[3].dt * 1e3 / n
-                        speed_metrics["tta_update"] = profilers[4].dt * 1e3 / n  # Includes backward + potential step
+                        speed_metrics["tta_update"] = profilers[4].dt * 1e3 / n
 
                     self.results[i].speed = speed_metrics
                     if self.args.verbose or self.args.save or self.args.save_txt or self.args.show:
@@ -523,16 +503,16 @@ class BasePredictor:
                     inv_sigma_sq_img = self.tta_stats.get("inv_sigma_sq_img")
                     mu_obj_dict = self.tta_stats.get("mu_obj_dict")
                     inv_sigma_sq_obj_dict = self.tta_stats.get("inv_sigma_sq_obj_dict")
-                    pi_obj = self.tta_stats.get("pi_obj")  # Can be None
+                    pi_obj = self.tta_stats.get("pi_obj")
 
                     self.tta_criterion = FeatureAlignmentLoss(
                         nc=len(self.model.names),
                         feat_stats={
-                            "mu_img": mu_img,  # Use loaded mu_img
-                            "inv_sigma_sq_img": inv_sigma_sq_img,  # Use loaded inv_sigma_sq_img
-                            "mu_obj_dict": mu_obj_dict,  # Use loaded mu_obj_dict
-                            "inv_sigma_sq_obj_dict": inv_sigma_sq_obj_dict,  # Use loaded inv_sigma_sq_obj_dict
-                            "pi_obj": pi_obj,  # Use loaded pi_obj (can be None)
+                            "mu_img": mu_img,
+                            "inv_sigma_sq_img": inv_sigma_sq_img,
+                            "mu_obj_dict": mu_obj_dict,
+                            "inv_sigma_sq_obj_dict": inv_sigma_sq_obj_dict,
+                            "pi_obj": pi_obj,
                         },
                         alpha=self.args.tta_alpha,
                         alpha_ema_loss=self.args.tta_alpha_ema_loss,
@@ -543,7 +523,7 @@ class BasePredictor:
                     tta_params = []
                     target_model = module
                     for p in target_model.parameters():
-                        p.requires_grad_(False)  # Freeze all parameters first
+                        p.requires_grad_(False)
 
                     LOGGER.info(f"Setting up TTA with update mode: '{self.args.tta_update_mode}'")
 
