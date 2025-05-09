@@ -40,18 +40,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from torch import optim
 
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data import load_inference_source
 from ultralytics.data.augment import LetterBox, classify_transforms
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.nn.modules import Adaptor
 from ultralytics.utils import DEFAULT_CFG, LOGGER, MACOS, WINDOWS, callbacks, colorstr, ops
 from ultralytics.utils.checks import check_imgsz, check_imshow
 from ultralytics.utils.files import increment_path
 from ultralytics.utils.torch_utils import select_device
-from ultralytics.utils.loss import FeatureAlignmentLoss
+from ultralytics.utils.tta import TTAManager
 
 STREAM_WARNING = """
 WARNING ⚠️ inference results will accumulate in RAM unless `stream=True` is passed, causing potential out-of-memory
@@ -398,6 +396,9 @@ class BasePredictor:
             if isinstance(v, cv2.VideoWriter):
                 v.release()
 
+        if self.tta_enabled:
+            self.tta_mgr.cleanup()
+
         if self.args.verbose and self.seen:
             t_pre = profilers[0].t / self.seen * 1e3
             t_inf = profilers[1].t / self.seen * 1e3
@@ -455,120 +456,23 @@ class BasePredictor:
         self.model.eval()
 
         if self.args.tta:
-            self.tta_features = None
-
+            mgr = TTAManager(self.args, self.device, self.save_dir, self.args.model)
             backend = getattr(self.model, "backend", "pytorch")
             module = self.model.model if backend == "pytorch" and hasattr(self.model, "model") else self.model
-
             named = list(module.named_modules())
             idx = self.args.tta_feature_layer
-            if isinstance(idx, str):
-                target = dict(named).get(idx, None)
-            elif isinstance(idx, int):
-                idx = idx % len(named)
-                target = named[idx][1]
-            else:
-                target = named[-2][1]
-            if target is None:
-                self.tta_enabled = False
-                return
-
-            target.register_forward_hook(lambda m, inp, out: setattr(self, "tta_features", out))
-
-            try:
-                model_path = (
-                    Path(self.args.model)
-                    if isinstance(self.args.model, (str, Path)) and Path(self.args.model).is_file()
-                    else None
-                )
-                tta_stats_path = model_path.parent / "tta_stats.pt" if model_path else None
-
-                if tta_stats_path is None or not tta_stats_path.exists():
-                    train_dir = self.save_dir.parent / "train"
-                    if train_dir.is_dir():
-                        tta_stats_path = train_dir / "tta_stats.pt"
-                    else:
-                        tta_stats_path = self.save_dir / "tta_stats.pt"
-
-                if tta_stats_path.exists():
-                    self.tta_stats = torch.load(tta_stats_path, map_location=self.device)
-                    LOGGER.info(f"Loaded TTA statistics from {tta_stats_path}")
-
-                    default_D_in_KL = 0.5
-                    D_in_KL = self.tta_stats.get("D_in_KL", default_D_in_KL)
-                    if D_in_KL == default_D_in_KL and "D_in_KL" not in self.tta_stats:
-                        LOGGER.warning(f"D_in_KL not found in TTA stats, using default value: {default_D_in_KL}")
-
-                    mu_img = self.tta_stats.get("mu_img")
-                    inv_sigma_sq_img = self.tta_stats.get("inv_sigma_sq_img")
-                    mu_obj_dict = self.tta_stats.get("mu_obj_dict")
-                    inv_sigma_sq_obj_dict = self.tta_stats.get("inv_sigma_sq_obj_dict")
-                    pi_obj = self.tta_stats.get("pi_obj")
-
-                    self.tta_criterion = FeatureAlignmentLoss(
-                        nc=len(self.model.names),
-                        feat_stats={
-                            "mu_img": mu_img,
-                            "inv_sigma_sq_img": inv_sigma_sq_img,
-                            "mu_obj_dict": mu_obj_dict,
-                            "inv_sigma_sq_obj_dict": inv_sigma_sq_obj_dict,
-                            "pi_obj": pi_obj,
-                        },
-                        alpha=self.args.tta_alpha,
-                        alpha_ema_loss=self.args.tta_alpha_ema_loss,
-                        D_in_KL=D_in_KL,
-                        tau1=self.args.tta_tau1,
-                        tau2=self.args.tta_tau2,
-                    ).to(self.device)
-                    tta_params = []
-                    target_model = module
-                    for p in target_model.parameters():
-                        p.requires_grad_(False)
-
-                    LOGGER.info(f"Setting up TTA with update mode: '{self.args.tta_update_mode}'")
-
-                    if self.args.tta_update_mode == "adaptor":
-                        LOGGER.info("TTA mode: Finding Adaptor layers to update.")
-                        for m in target_model.modules():
-                            if isinstance(m, Adaptor):
-                                for p in m.parameters():
-                                    p.requires_grad_(True)
-                                    tta_params.append(p)
-                        if not tta_params:
-                            LOGGER.warning("TTA update mode is 'adaptor', but no Adaptor layers found.")
-
-                    elif self.args.tta_update_mode == "full":
-                        LOGGER.info("TTA mode: Setting all model parameters to be updated.")
-                        for p in target_model.parameters():
-                            p.requires_grad_(True)
-                            tta_params.append(p)  # Collect all parameters
-
-                    else:
-                        LOGGER.warning(
-                            f"Unknown tta_update_mode: '{self.args.tta_update_mode}'. Supported modes are 'adaptor' and 'full'. Defaulting to no TTA updates."
-                        )
-                        # Ensure tta_params is empty if mode is unknown
-                        tta_params = []
-
-                    if not tta_params:
-                        LOGGER.warning(
-                            f"TTA enabled but no parameters selected for update mode '{self.args.tta_update_mode}'. Disabling TTA."
-                        )
-                        self.tta_enabled = False
-                    else:
-                        self.tta_optimizer = optim.Adam(tta_params, lr=self.args.tta_lr)
-                        self.tta_enabled = True
-                        LOGGER.info(
-                            f"TTA enabled with {len(tta_params)} trainable parameters (mode='{self.args.tta_update_mode}', lr={self.args.tta_lr})"
-                        )
-
+            target = named[idx % len(named)][1] if isinstance(idx, int) else dict(named).get(idx, None)
+            if target and mgr.load_stats():
+                mgr.register_hook(target)
+                if mgr.build(module, nc=len(self.model.names)):
+                    self.tta_mgr = mgr
+                    self.tta_enabled = True
+                    self.tta_criterion = mgr.criterion
+                    self.tta_optimizer = mgr.optimizer
+                    self.tta_stats = mgr.stats
                 else:
-                    LOGGER.warning(
-                        f"TTA statistics file not found at expected locations ({tta_stats_path} or others). TTA disabled."
-                    )
-                    self.tta_enabled = False
-            except Exception as e:
-                LOGGER.error(f"Failed to setup TTA: {e}", exc_info=True)
+                    mgr.cleanup()
+            else:
                 self.tta_enabled = False
         else:
             self.tta_enabled = False

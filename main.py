@@ -1,5 +1,5 @@
 from ultralytics import YOLO
 
-model = YOLO("yolo11n.pt")
+model = YOLO("yolo12n-tta.pt")
 
-model.train(data="coco128.yaml")
+model.val(data="coco.yaml",tta=True)
