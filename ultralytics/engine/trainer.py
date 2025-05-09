@@ -946,15 +946,14 @@ class BaseTrainer:
         # Image-level stats
         if all_F_img:
             F_img_all = torch.cat(all_F_img, dim=0)
-            # Limit to the exact number of samples requested
             if F_img_all.shape[0] > num_samples_to_process:
                 F_img_all = F_img_all[:num_samples_to_process]
 
             if F_img_all.numel() > 0:
                 mu_img = F_img_all.mean(dim=0)
-                var_img = torch.clamp(F_img_all.var(dim=0, unbiased=True), min=0.0)
+                var_img = F_img_all.var(dim=0, unbiased=False)
                 tta_stats["mu_img"] = mu_img
-                tta_stats["inv_sigma_sq_img"] = 1.0 / (var_img + epsilon)
+                tta_stats["inv_sigma_sq_img"] = var_img.clamp(min=epsilon).reciprocal()
                 LOGGER.info(f"Calculated image-level stats from {F_img_all.shape[0]} samples.")
             else:
                 LOGGER.warning("No valid image-level features collected.")
@@ -966,19 +965,17 @@ class BaseTrainer:
         inv_sigma_sq_obj_dict = {}
         obj_counts_per_class = {}
         actual_total_obj_count = 0
-        valid_F_obj_dict_gt_cat = {}  # Store concatenated features per class
 
         for cls_idx in range(nc):
             if all_F_obj_dict_gt[cls_idx]:
                 concatenated_features = torch.cat(all_F_obj_dict_gt[cls_idx], dim=0)
                 if concatenated_features.numel() > 0:
-                    valid_F_obj_dict_gt_cat[cls_idx] = concatenated_features
                     count = concatenated_features.shape[0]
                     obj_counts_per_class[cls_idx] = count
                     actual_total_obj_count += count
                     mu_obj_dict[cls_idx] = concatenated_features.mean(dim=0)
-                    var_obj_cls = torch.clamp(concatenated_features.var(dim=0, unbiased=True), min=0.0)
-                    inv_sigma_sq_obj_dict[cls_idx] = 1.0 / (var_obj_cls + epsilon)
+                    var_obj_cls = concatenated_features.var(dim=0, unbiased=False)
+                    inv_sigma_sq_obj_dict[cls_idx] = var_obj_cls.clamp(min=epsilon).reciprocal()
                 else:
                     obj_counts_per_class[cls_idx] = 0
             else:
@@ -1010,7 +1007,7 @@ class BaseTrainer:
         if img_stats_ok and obj_stats_ok:
             mu_img = tta_stats["mu_img"]
             inv_sigma_sq_img = tta_stats["inv_sigma_sq_img"]
-            sigma_sq_img = 1.0 / (inv_sigma_sq_img + epsilon)
+            sigma_sq_img = inv_sigma_sq_img.clamp(min=epsilon).reciprocal()
             img_feat_dim = mu_img.shape[0]
             obj_feat_dim = next((v.shape[0] for v in mu_obj_dict.values()), None)  # Get dim from first available class
 
@@ -1021,7 +1018,7 @@ class BaseTrainer:
                     f"Feature dimensions mismatch (img:{img_feat_dim}, obj:{obj_feat_dim}). Skipping D_in_KL."
                 )
             else:
-                D_in_KL = 0.0
+                D_in_KL = torch.zeros((), device=mu_img.device, dtype=mu_img.dtype)
                 device = mu_img.device  # Should be CPU
                 sigma_sq_img = sigma_sq_img.to(device)
 
@@ -1029,7 +1026,7 @@ class BaseTrainer:
                     if cls_idx in mu_obj_dict:
                         mu_obj_cls = mu_obj_dict[cls_idx].to(device)
                         inv_sigma_sq_obj_cls = inv_sigma_sq_obj_dict[cls_idx].to(device)
-                        sigma_sq_obj_cls = 1.0 / (inv_sigma_sq_obj_cls + epsilon)
+                        sigma_sq_obj_cls = inv_sigma_sq_obj_cls.clamp(min=epsilon).reciprocal()
                         pi_cls = tta_stats["pi_obj"][cls_idx].to(device)
 
                         # KL divergence calculation with stability additions
