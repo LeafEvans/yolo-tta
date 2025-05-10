@@ -253,13 +253,13 @@ class BaseValidator:
                         loss_val.backward()
                         if self.args.tta_update_strategy in ("always",) or update_flag:
                             self.tta_optimizer.step()
-                # no_grad for final predictions
                 with torch.no_grad():
-                    preds = model(imgs, augment=augment)
+                    with dt[1]:
+                        preds = model(imgs, augment=augment)
             else:
-                # Standard validation under no_grad
                 with torch.no_grad():
-                    preds = model(imgs, augment=augment)
+                    with dt[1]:
+                        preds = model(imgs, augment=augment)
 
             # Loss
             with dt[2]:

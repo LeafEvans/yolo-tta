@@ -103,6 +103,7 @@ class TTAManager:
         params = []
         for p in model.parameters():
             p.requires_grad_(False)
+
         if self.args.tta_update_mode == "adaptor":
             for m in model.modules():
                 if isinstance(m, Adaptor):
@@ -113,9 +114,22 @@ class TTAManager:
             for p in model.parameters():
                 p.requires_grad_(True)
                 params.append(p)
+        elif self.args.tta_update_mode == "conv":
+            for m in model.modules():
+                if isinstance(m, (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)):
+                    if m.weight is not None:
+                        m.weight.requires_grad_(True)
+                        params.append(m.weight)
+                    if m.bias is not None:
+                        m.bias.requires_grad_(True)
+                        params.append(m.bias)
+        else:
+            LOGGER.warning(f"Unknown tta_update_mode: {self.args.tta_update_mode}. TTA will not update any parameters.")
 
         if not params:
-            LOGGER.warning("No TTA parameters found, disabling TTA")
+            LOGGER.warning(
+                f"No TTA parameters found for mode '{self.args.tta_update_mode}', disabling TTA. Check model structure and tta_update_mode."
+            )
             return False
 
         self.optimizer = optim.Adam(params, lr=self.args.tta_lr)
