@@ -244,7 +244,8 @@ class BaseValidator:
             imgs = batch["img"]
 
             if self.tta_enabled:
-                raw = model(imgs, augment=augment, embed=self.args.tta_feature_layer)
+                with torch.set_grad_enabled(True):
+                    raw = model(imgs, augment=augment, embed=self.args.tta_feature_layer)
                 F_img, F_obj = self._extract_features_for_tta(imgs, raw)
                 if F_img is not None:
                     loss_val, _, update_flag = self.tta_criterion(F_img, F_obj, loss_mode=self.args.tta_loss_mode)
@@ -255,7 +256,7 @@ class BaseValidator:
                             self.tta_optimizer.step()
                 with torch.no_grad():
                     with dt[1]:
-                        preds = model(imgs, augment=augment)
+                        preds = model(imgs, augment=augment, embed=self.args.tta_feature_layer)
             else:
                 with torch.no_grad():
                     with dt[1]:
